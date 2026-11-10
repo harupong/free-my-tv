@@ -320,7 +320,10 @@ final class HomeMode {
 
     /** After the TV boots (and after a TV update): wait for the system to settle and check Free My TV mode. */
     static void bootCheck(Context c) {
-        if (AMAZON) return;
+        if (AMAZON) {   // Fire TV: only FireGuard and the alarms' delay to check (fireVerify)
+            ModeJob.schedule(c, ModeJob.VERIFY, null, 45_000);
+            return;
+        }
         ensureRemoteService(c, 30_000);
         ModeJob.schedule(c, ModeJob.VERIFY, null, 45_000);
         Prefs.reload();
@@ -451,13 +454,17 @@ final class HomeMode {
     private static final String REMOTE_SERVICE = PKG + "/" + PKG + ".RemoteKeyService";
     private static final Pattern SERVICE = Pattern.compile("[\\w.]+/[\\w.$]+");
 
-    /** Adds ours to the enabled accessibility services (keeping the others, like TalkBack), or takes it out. */
     private static void remoteService(Context c, Adb adb, boolean on) throws IOException {
+        accessibility(c, adb, REMOTE_SERVICE, on);
+    }
+
+    /** Adds one of ours to the enabled accessibility services (keeping the others, like TalkBack), or takes it out. */
+    private static void accessibility(Context c, Adb adb, String service, boolean on) throws IOException {
         String current = adb.shell("settings get secure enabled_accessibility_services").trim();
         if (current.equals("null")) current = "";
         List<String> others = new ArrayList<>();
         for (String one : current.split(":")) {
-            if (one.isEmpty() || one.equals(REMOTE_SERVICE)) continue;
+            if (one.isEmpty() || one.equals(service)) continue;
             // Only plain component names go back into the shell command; anything else is left alone.
             if (!SERVICE.matcher(one).matches()) {
                 AppLog.w("accessibility services left as they are: unexpected entry");
@@ -465,20 +472,20 @@ final class HomeMode {
             }
             others.add(one);
         }
-        if (on == current.contains(REMOTE_SERVICE)) return;
+        if (on == Arrays.asList(current.split(":")).contains(service)) return;
         List<String> list = new ArrayList<>(others);
         if (on) {
             JSONObject s = state(c);
             try { s.put("accessibilityWasOff", !"1".equals(adb.shell("settings get secure accessibility_enabled").trim())); }
             catch (JSONException ignored) {}
             save(c, s);
-            list.add(REMOTE_SERVICE);
+            list.add(service);
         }
         adb.shell(list.isEmpty() ? "settings delete secure enabled_accessibility_services"
                 : "settings put secure enabled_accessibility_services '" + String.join(":", list) + "'");
         if (on) adb.shell("settings put secure accessibility_enabled 1");
         else if (list.isEmpty() && state(c).optBoolean("accessibilityWasOff")) adb.shell("settings put secure accessibility_enabled 0");
-        AppLog.w("remote buttons service " + (on ? "on" : "off"));
+        AppLog.w(service.substring(service.lastIndexOf('.') + 1) + " " + (on ? "on" : "off"));
     }
 
     private static final String NOW_PLAYING = PKG + "/" + PKG + ".NowPlaying";
@@ -539,7 +546,7 @@ final class HomeMode {
     private static void applyFree(Context c) {
         JSONObject s = state(c);
         if (AMAZON) {
-            done(c, Ui.tr("On Fire TV the Home button belongs to Amazon's home screen. Free My TV stays an app here: open it from your apps."));
+            applyFreeFire(c, s);
             return;
         }
         if (BRICKS) {
@@ -697,6 +704,10 @@ final class HomeMode {
 
     private static void applyOriginal(Context c) {
         JSONObject s = state(c);
+        if (AMAZON) {
+            applyOriginalFire(c, s);
+            return;
+        }
         try (Adb adb = connect(c, s)) {
             busy(c, Ui.tr("Turning the apps back on…"));
             String home = originalHome(s);
@@ -845,6 +856,10 @@ final class HomeMode {
     static void revertHomeNow(Context app) {
         synchronized (RUN) {
             JSONObject s = state(app);
+            if (AMAZON) {
+                revertFire(app, s);
+                return;
+            }
             try (Adb adb = Adb.connect(app, 10_000, null)) {
                 boolean ours = homeHolder(adb).contains(PKG);
                 if (!ours && (!FREE.equals(s.optString("mode")) || s.optBoolean("homeReverted"))) return;
@@ -913,7 +928,11 @@ final class HomeMode {
                 s.remove("busy");
                 save(app, s);
             } catch (JSONException ignored) {}
-            if (!FREE.equals(s.optString("mode")) || AMAZON) return;
+            if (!FREE.equals(s.optString("mode"))) return;
+            if (AMAZON) {
+                fireVerify(app, s);
+                return;
+            }
             if (BRICKS) {
                 // Switched by a version that still allowed it here: the TV's own home screen back before the next restart.
                 AppLog.w("Free My TV mode where the switch kept a TV from starting: back to Original");
@@ -1494,6 +1513,244 @@ final class HomeMode {
             s.put("notices", list);
         } catch (JSONException ignored) {}
         save(c, s);
+    }
+
+    // MARK: - Fire TV (after dumbtv home, github.com/humblemuzzu/dumbtv)
+
+    private static final String FIRE_GUARD = PKG + "/" + PKG + ".FireGuard";
+    static final String FIRE_GRANT = "adb shell pm grant " + PKG + " android.permission.WRITE_SECURE_SETTINGS";
+
+    /**
+     * Free My TV mode on Fire TV: nothing is turned off (every com.amazon.* is refused anyway) and the screensaver stays
+     * Amazon's. Amazon's launcher keeps HOME, so FireGuard puts ours over it, and alarms may fire at once (min_futurity=0)
+     * for its launch to skip the 5 s app-switch delay. Original puts both back. Fire OS 7.7 closes every ADB connection
+     * made on the TV itself (127.0.0.1 and its own addresses alike), so with WRITE_SECURE_SETTINGS, granted once from a
+     * computer ({@link #FIRE_GRANT}), the app writes those two settings itself, without ADB.
+     */
+    private static void applyFreeFire(Context c, JSONObject s) {
+        try (FireStore store = FireStore.open(c, s, true)) {
+            fireDelay(c, store, true);
+            fireAccessibility(c, store, true);
+            s = state(c);
+            s.put("mode", FREE).put("since", System.currentTimeMillis()).put("homeReverted", false)
+                    .put("disabled", new JSONArray());
+            save(c, s);
+            notice(c, Ui.trf("Free My TV is on: new home screen, {n} apps turned off.", "n", 0));
+            done(c, null);
+            store.home();   // Amazon's home comes up, and ours over it
+        } catch (Exception e) {
+            done(c, Ui.trf("Couldn't turn on Free My TV: {error}", "error", e.getMessage()));
+        }
+    }
+
+    private static void applyOriginalFire(Context c, JSONObject s) {
+        try (FireStore store = FireStore.open(c, s, true)) {
+            busy(c, Ui.tr("Restoring the original home screen…"));
+            fireAccessibility(c, store, false);
+            fireDelay(c, store, false);
+            store.nowPlayingOff();
+            SleepTimer.stop(c);
+            s = state(c);
+            s.put("mode", ORIGINAL).put("since", System.currentTimeMillis()).put("homeReverted", false)
+                    .put("disabled", new JSONArray());
+            save(c, s);
+            notice(c, Ui.tr("Original mode: the factory home screen, screensaver and apps are back."));
+            done(c, null);
+            store.home();
+            if (WatchNext.allowed(c)) ModeJob.schedule(c, ModeJob.REVOKE_WATCH, null, 5_000);
+        } catch (Exception e) {
+            done(c, Ui.trf("Couldn't go back to the original: {error}", "error", e.getMessage()));
+        }
+    }
+
+    /** The watchdog's revert: Amazon's home screen keeps the Home button again. */
+    private static void revertFire(Context app, JSONObject s) {
+        if (!FREE.equals(s.optString("mode")) || s.optBoolean("homeReverted")) return;
+        try (FireStore store = FireStore.open(app, s, false)) {
+            fireAccessibility(app, store, false);
+            fireDelay(app, store, false);
+            store.nowPlayingOff();
+            SleepTimer.stop(app);
+            save(app, state(app).put("homeReverted", true));
+            notice(app, Ui.tr("Free My TV's home screen crashed 3 times in a row; I switched back to the original one."));
+            store.home();
+        } catch (Exception e) {
+            AppLog.w("could not give the home screen back: " + e.getMessage());
+        }
+    }
+
+    /** After a boot or an update of this app (Android turns its accessibility services off then): both back on. */
+    private static void fireVerify(Context app, JSONObject s) {
+        if (s.optBoolean("homeReverted")) return;
+        try (FireStore store = FireStore.open(app, s, false)) {
+            fireDelay(app, store, true);
+            fireAccessibility(app, store, true);
+            if (store.adb != null) nowPlaying(app, store.adb, nowPlayingOn());
+        } catch (IOException e) {
+            AppLog.w("fire guard: " + e.getMessage());
+        }
+    }
+
+    /** The settings Fire TV's switch writes: directly with WRITE_SECURE_SETTINGS, else through the TV's ADB. */
+    private static final class FireStore implements java.io.Closeable {
+        final Context c;
+        final Adb adb;   // null: the app writes them itself
+
+        private FireStore(Context c, Adb adb) {
+            this.c = c;
+            this.adb = adb;
+        }
+
+        static FireStore open(Context c, JSONObject s, boolean asking) throws IOException {
+            if (c.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS") == PackageManager.PERMISSION_GRANTED) {
+                return new FireStore(c, null);
+            }
+            try {
+                return new FireStore(c, asking ? connect(c, s) : Adb.connect(c, 10_000, null));
+            } catch (IOException e) {
+                AppLog.w("Fire OS may refuse the app's own ADB; from a computer: " + FIRE_GRANT);
+                throw e;
+            }
+        }
+
+        /** global or secure; null when unset. */
+        String get(String table, String key) throws IOException {
+            if (adb != null) {
+                String v = adb.shell("settings get " + table + " " + key).trim();
+                return v.equals("null") || v.isEmpty() ? null : v;
+            }
+            android.content.ContentResolver r = c.getContentResolver();
+            return "global".equals(table) ? android.provider.Settings.Global.getString(r, key)
+                    : android.provider.Settings.Secure.getString(r, key);
+        }
+
+        /** null deletes it. Values are checked by the callers (plain component names and numbers). */
+        void put(String table, String key, String value) throws IOException {
+            if (adb != null) {
+                adb.shell(value == null ? "settings delete " + table + " " + key
+                        : "settings put " + table + " " + key + " '" + value + "'");
+                return;
+            }
+            android.content.ContentResolver r = c.getContentResolver();
+            boolean ok = "global".equals(table) ? android.provider.Settings.Global.putString(r, key, value)
+                    : android.provider.Settings.Secure.putString(r, key, value);
+            if (!ok) throw new IOException("couldn't write " + key);
+        }
+
+        void nowPlayingOff() {
+            if (adb == null) return;   // without ADB it was never allowed
+            try {
+                nowPlaying(c, adb, false);
+            } catch (IOException e) {
+                AppLog.w("now playing: " + e.getMessage());
+            }
+        }
+
+        /** HOME: Amazon's home screen, with FireGuard on ours over it. */
+        void home() {
+            if (adb != null) {
+                homeAfter(adb);
+                return;
+            }
+            try {
+                c.startActivity(new android.content.Intent(android.content.Intent.ACTION_MAIN)
+                        .addCategory(android.content.Intent.CATEGORY_HOME)
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK));
+            } catch (RuntimeException e) {
+                AppLog.w("home after the switch: " + e.getMessage());
+            }
+        }
+
+        @Override public void close() {
+            if (adb != null) adb.close();
+        }
+    }
+
+    /** Adds FireGuard to the enabled accessibility services (keeping the others, like VoiceView), or takes it out. */
+    private static void fireAccessibility(Context c, FireStore store, boolean on) throws IOException {
+        String current = store.get("secure", "enabled_accessibility_services");
+        if (current == null) current = "";
+        List<String> list = new ArrayList<>();
+        for (String one : current.split(":")) {
+            if (one.isEmpty() || one.equals(FIRE_GUARD)) continue;
+            if (!SERVICE.matcher(one).matches()) {
+                AppLog.w("accessibility services left as they are: unexpected entry");
+                return;
+            }
+            list.add(one);
+        }
+        if (on == Arrays.asList(current.split(":")).contains(FIRE_GUARD)) return;
+        if (on) {
+            JSONObject s = state(c);
+            try { s.put("accessibilityWasOff", !"1".equals(store.get("secure", "accessibility_enabled"))); }
+            catch (JSONException ignored) {}
+            save(c, s);
+            list.add(FIRE_GUARD);
+        }
+        store.put("secure", "enabled_accessibility_services", list.isEmpty() ? null : String.join(":", list));
+        if (on) store.put("secure", "accessibility_enabled", "1");
+        else if (list.isEmpty() && state(c).optBoolean("accessibilityWasOff")) store.put("secure", "accessibility_enabled", "0");
+        AppLog.w("FireGuard " + (on ? "on" : "off") + (store.adb == null ? " (without ADB)" : ""));
+    }
+
+    private static final Pattern ALARM_CONSTANT = Pattern.compile("[\\w.]+=[\\w.-]+");
+
+    /**
+     * Alarms fire no sooner than 5 s from now; FireGuard's must fire at once. Android 11 and older (every Fire OS so
+     * far) read min_futurity from the global alarm_manager_constants; Android 12 and newer from DeviceConfig, which
+     * only ADB can write. The TV's value is kept in the state ("alarmFuturity", empty for none) and put back when off.
+     */
+    private static void fireDelay(Context c, FireStore store, boolean on) throws IOException {
+        boolean config = Build.VERSION.SDK_INT >= 31;
+        if (config && store.adb == null) {
+            AppLog.w("alarm delay left as it is: Android 12+ needs ADB for it");
+            return;
+        }
+        String all = config ? null : store.get("global", "alarm_manager_constants");
+        String now = config ? store.adb.shell("device_config get alarm_manager min_futurity").trim()
+                : constant(all == null ? "" : all);
+        if ("null".equals(now)) now = "";
+        JSONObject s = state(c);
+        String value;
+        if (on) {
+            if ("0".equals(now)) return;
+            if (!s.has("alarmFuturity")) {
+                try { save(c, s.put("alarmFuturity", now)); } catch (JSONException ignored) {}
+            }
+            value = "0";
+        } else {
+            if (!s.has("alarmFuturity")) return;   // never ours
+            value = s.optString("alarmFuturity");
+            if (!value.matches("\\d*")) value = "";
+        }
+        if (config) {
+            store.adb.shell(value.isEmpty() ? "device_config delete alarm_manager min_futurity"
+                    : "device_config put alarm_manager min_futurity " + value);
+        } else {
+            List<String> parts = new ArrayList<>();
+            for (String one : all == null ? new String[0] : all.split(",")) {
+                if (one.isEmpty() || one.startsWith("min_futurity=")) continue;
+                if (!ALARM_CONSTANT.matcher(one).matches()) {
+                    AppLog.w("alarm constants left as they are: unexpected entry");
+                    return;
+                }
+                parts.add(one);
+            }
+            if (!value.isEmpty()) parts.add("min_futurity=" + value);
+            store.put("global", "alarm_manager_constants", parts.isEmpty() ? null : String.join(",", parts));
+        }
+        if (!on) {
+            s = state(c);
+            s.remove("alarmFuturity");
+            save(c, s);
+        }
+        AppLog.w("alarm delay " + (on ? "off" : "back to " + (value.isEmpty() ? "the default" : value)));
+    }
+
+    /** min_futurity in alarm_manager_constants ("a=1,min_futurity=5000"), or "". */
+    private static String constant(String all) {
+        for (String one : all.split(",")) if (one.startsWith("min_futurity=")) return one.substring(13);
+        return "";
     }
 
     // MARK: - Helpers

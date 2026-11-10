@@ -19,6 +19,10 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- "Continue watching": what you left half-way in your apps, from Android TV's own Watch Next list. -->
     <uses-permission android:name="android.permission.READ_TV_LISTINGS" />
+    <!-- Fire TV only, granted from a computer (adb shell pm grant io.freemytv android.permission.WRITE_SECURE_SETTINGS):
+         Fire OS 7.7 closes ADB connections made on the TV itself, so Free My TV mode writes its two settings directly
+         (FireGuard's accessibility entry and the alarms' min_futurity, HomeMode.FireStore). Not granted anywhere else. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
     <!-- The Bluetooth status icon: whether headphones or a speaker are connected. Before Android 12 the permission is
          granted at install; from 12 it is asked for when Status icons is turned on (and only the icon needs it). -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
@@ -234,6 +238,21 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/remote_key_service" />
+        </service>
+
+        <!-- Fire TV's Home button in Free My TV mode (FireGuard): Amazon's home screen keeps it, so this puts ours over it. -->
+        <service
+            android:name=".FireGuard"
+            android:process=":keys"
+            android:exported="true"
+            android:label="Free My TV"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/fire_guard" />
         </service>
 
         <!-- tools/photos.py writes photos here where adb can't reach the app's external folder (Android 11, Fire OS 8);

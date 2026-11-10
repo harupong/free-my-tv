@@ -26,8 +26,18 @@ before you do it, and let them do the taps on the TV.
   switch refuses on both (`HomeMode.BRICKS`, Huawei by brand or by `com.huawei.system.BuildEx.getOsBrand()`), and
   the boot check or an update takes one already in Free My TV mode back to *Original*. On a phone (`HomeMode.phone`:
   telephony, no leanback, not in TV mode) the settings say the APK goes on the TV, and the switch refuses. On Amazon Fire TV (Fire OS: `HomeMode.AMAZON`), Amazon's launcher keeps the Home button (`priority=950`
-  on `CATEGORY_HOME`), so the switch refuses Free My TV mode while *Original* and the watchdog still run, and no
-  `com.amazon.*` package is ever turned off (`mayTurnOff`).
+  on `CATEGORY_HOME`; `set-home-activity` answers Success and changes nothing), and no `com.amazon.*` package is ever
+  turned off (`mayTurnOff`). Free My TV mode there turns nothing off and keeps Amazon's screensaver: an accessibility
+  service, `FireGuard` (after dumbtv home's Guard, MIT, github.com/humblemuzzu/dumbtv; window changes only), covers
+  Amazon's home (`HomeActivity_vNext`) when it comes up and opens `FireHomeActivity` through an alarm, which skips
+  the 5 s app-switch delay only with `min_futurity=0` (`HomeMode.fireDelay`: `alarm_manager_constants` up to Android
+  11, `device_config` from 12; the TV's value kept in the state as `alarmFuturity`). *Original* and the watchdog take
+  both back; the boot check and an update put them on again (`fireVerify`). Fire OS 7.7 (an AFTKA, PS7713) closes
+  every ADB connection made on the TV itself, to 127.0.0.1 and its own addresses alike (from a computer it answers),
+  so the TV's ADB can't make the switch there: after installing, run
+  `adb shell pm grant io.freemytv android.permission.WRITE_SECURE_SETTINGS` from the computer (`HomeMode.FIRE_GRANT`;
+  an uninstall takes it back), and `FireStore` writes the two settings directly; without it, it tries ADB. Amazon's other launcher screens (its
+  settings grid) stay, and holding Home still opens Fire OS's quick menu.
 - Never turn off an app that saved a Wi-Fi network: Android deletes its networks and Original can't bring them
   back (`wifiOwners` in `HomeMode`). When the Wi-Fi service doesn't answer, the switch stops on Wi-Fi, and the boot
   check leaves the setup app and the stock home screen for later.

@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">Free My TV</string>
     <string name="remote_key_service">Lets the app buttons on the remote (Netflix, YouTube, Prime Video, TCL Channel) open the apps you picked in Free My TV, from any app. It only reads those buttons.</string>
+    <string name="fire_guard">Opens Free My TV\'s home screen when the Home button brings up Amazon\'s. It only sees which app comes to the front, never what is on the screen.</string>
 </resources>
