@@ -32,7 +32,10 @@ before you do it, and let them do the taps on the TV.
   Amazon's home (`HomeActivity_vNext`) when it comes up and opens `FireHomeActivity` through an alarm, which skips
   the 5 s app-switch delay only with `min_futurity=0` (`HomeMode.fireDelay`: `alarm_manager_constants` up to Android
   11, `device_config` from 12; the TV's value kept in the state as `alarmFuturity`). *Original* and the watchdog take
-  both back; the boot check and an update put them on again (`fireVerify`). Fire OS 7.7 (an AFTKA, PS7713) closes
+  both back; the boot check and an update put them on again (`fireVerify`), and turn the guard off and on when it's
+  listed but not running (Android 11 doesn't bind a killed service again). Turned off, a Fire OS TV restarts quietly,
+  and Amazon's home can be up before the guard: in its first 5 minutes, until it sees a window, it takes the screen for
+  Amazon's home (`FireGuard.bootHome`). Fire OS 7.7 (an AFTKA, PS7713) closes
   every ADB connection made on the TV itself, to 127.0.0.1 and its own addresses alike (from a computer it answers),
   so the TV's ADB can't make the switch there: after installing, run
   `adb shell pm grant io.freemytv android.permission.WRITE_SECURE_SETTINGS` from the computer (`HomeMode.FIRE_GRANT`;

@@ -1679,8 +1679,19 @@ final class HomeMode {
             }
             list.add(one);
         }
-        if (on == Arrays.asList(current.split(":")).contains(FIRE_GUARD)) return;
-        if (on) {
+        boolean listed = Arrays.asList(current.split(":")).contains(FIRE_GUARD);
+        boolean rebind = on && listed && !fireGuardBound(c);
+        if (rebind) {
+            // Listed but not running: Android 11 doesn't bind a killed service again until the setting changes
+            // (dumbtv's launcher.sh does the same), so it goes out and back in.
+            store.put("secure", "enabled_accessibility_services", list.isEmpty() ? null : String.join(":", list));
+            listed = false;
+            AppLog.w("FireGuard not running: turned off and on again");
+        }
+        if (on == listed) return;
+        if (rebind) {
+            list.add(FIRE_GUARD);   // what was there before the switch is already kept
+        } else if (on) {
             JSONObject s = state(c);
             try { s.put("accessibilityWasOff", !"1".equals(store.get("secure", "accessibility_enabled"))); }
             catch (JSONException ignored) {}
@@ -1691,6 +1702,19 @@ final class HomeMode {
         if (on) store.put("secure", "accessibility_enabled", "1");
         else if (list.isEmpty() && state(c).optBoolean("accessibilityWasOff")) store.put("secure", "accessibility_enabled", "0");
         AppLog.w("FireGuard " + (on ? "on" : "off") + (store.adb == null ? " (without ADB)" : ""));
+    }
+
+    /** Whether Android runs FireGuard now (the enabled list only says it should). */
+    private static boolean fireGuardBound(Context c) {
+        android.view.accessibility.AccessibilityManager am = c.getSystemService(android.view.accessibility.AccessibilityManager.class);
+        if (am == null) return true;
+        for (android.accessibilityservice.AccessibilityServiceInfo i
+                : am.getEnabledAccessibilityServiceList(android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK)) {
+            android.content.pm.ResolveInfo r = i.getResolveInfo();
+            if (r != null && r.serviceInfo != null && PKG.equals(r.serviceInfo.packageName)
+                    && (PKG + ".FireGuard").equals(r.serviceInfo.name)) return true;
+        }
+        return false;
     }
 
     private static final Pattern ALARM_CONSTANT = Pattern.compile("[\\w.]+=[\\w.-]+");
