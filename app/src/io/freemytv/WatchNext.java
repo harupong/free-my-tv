@@ -19,8 +19,8 @@ import java.util.Set;
 /**
  * What you were watching in your apps, from Android TV's own lists (TvContract, needs READ_TV_LISTINGS): the system
  * Watch Next list, where Prime Video, Disney+, HBO Max, Plex and others note what you left half-way, and the home
- * screen channels some apps publish under the name "Continue Watching" instead (Stremio). Newest first, a few per app,
- * so one show doesn't fill the row.
+ * screen channels some apps publish under the name "Continue Watching" instead (Stremio). Newest first, a few per app
+ * so one show doesn't fill the row, then the rest up to MAX when there's room.
  */
 final class WatchNext {
     private WatchNext() {}
@@ -28,7 +28,7 @@ final class WatchNext {
     static final String PERMISSION = "android.permission.READ_TV_LISTINGS";
     /** Declared by apps that write the TV's lists (apps can also write their own rows and Watch Next without it). */
     private static final String WRITE_EPG = "com.android.providers.tv.permission.WRITE_EPG_DATA";
-    static final int PER_APP = 2, MAX = 12;
+    static final int PER_APP = 2, MAX = 10;
     /** Channel names that mean "continue watching" (apps name their own channel). */
     private static final Set<String> CHANNEL_NAMES = new HashSet<>(java.util.Arrays.asList(
             "continue watching", "seguir viendo", "continuar viendo", "continuar assistindo", "continue assistindo"));
@@ -40,6 +40,8 @@ final class WatchNext {
         String intent;
         final Uri pictureUri;
         final String pictureKey, bannerKey;
+        /** A picture on the Jellyfin server (its path there, Recently Added's cards), which WatchArt asks Jellyfin for. */
+        final String jellyfinPicture;
         private final String picture;
 
         Item(String pkg, String poster, String thumbnail) {
@@ -50,6 +52,30 @@ final class WatchNext {
                     || "android.resource".equalsIgnoreCase(uri.getScheme())) ? uri : null;
             pictureKey = pictureUri == null ? null : picture;
             bannerKey = "banner:" + pkg;
+            jellyfinPicture = null;
+        }
+
+        /** One of Jellyfin's items: `path` is its picture on the server (null: the app's banner). */
+        Item(String pkg, String path, boolean jellyfin) {
+            this.pkg = pkg;
+            picture = path;
+            pictureUri = null;
+            jellyfinPicture = path;
+            pictureKey = path == null ? null : "jellyfin:" + path;
+            bannerKey = "banner:" + pkg;
+        }
+
+        /** The same card with a picture from the Jellyfin server instead (Jellyfin.episodePictures). */
+        Item withJellyfinPicture(String path) {
+            Item it = new Item(pkg, path, true);
+            it.title = title;
+            it.episode = episode;
+            it.app = app;
+            it.duration = duration;
+            it.position = position;
+            it.engaged = engaged;
+            it.intent = intent;
+            return it;
         }
 
         /** The picture for a 16:9 card: the thumbnail (usually 16:9) before the poster. */
@@ -87,17 +113,31 @@ final class WatchNext {
             if (off.contains(it.pkg) || hidden.contains(hideKey(it))) i.remove();
         }
         Collections.sort(all, (a, b) -> Long.compare(b.engaged, a.engaged));
-        List<Item> out = new ArrayList<>();
-        Map<String, Integer> perApp = new HashMap<>();
+        // Duplicates out, newest kept.
+        List<Item> unique = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (Item it : all) {
-            String key = it.pkg + "|" + (it.intent != null ? it.intent : it.title);
+            if (seen.add(it.pkg + "|" + (it.intent != null ? it.intent : it.title))) unique.add(it);
+        }
+        // First a few per app, so every app gets a place; then the newest of the rest fill what's left.
+        Set<Item> picked = new HashSet<>();
+        Map<String, Integer> perApp = new HashMap<>();
+        for (Item it : unique) {
+            if (picked.size() >= MAX) break;
             int n = perApp.containsKey(it.pkg) ? perApp.get(it.pkg) : 0;
-            if (n >= PER_APP || !seen.add(key)) continue;
+            if (n >= PER_APP) continue;
             perApp.put(it.pkg, n + 1);
+            picked.add(it);
+        }
+        for (Item it : unique) {
+            if (picked.size() >= MAX) break;
+            picked.add(it);
+        }
+        List<Item> out = new ArrayList<>();
+        for (Item it : unique) {
+            if (!picked.contains(it)) continue;
             it.app = appName(c, it.pkg);
             out.add(it);
-            if (out.size() >= MAX) break;
         }
         return out;
     }

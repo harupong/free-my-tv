@@ -30,7 +30,8 @@ import java.util.concurrent.Executors;
  * centre-cropped), and kept in memory. Drawing only reuses them. Only pictures already on the TV are read (content:// and
  * android.resource://, from the apps themselves): the app never downloads an address another app wrote (http, https),
  * since it only talks to TMDB, Open-Meteo and Binance, and never opens files (file://). Anything else, or a picture that
- * can't be read, shows the app's TV banner instead, and isn't tried again for a while.
+ * can't be read, shows the app's TV banner instead, and isn't tried again for a while. Recently Added's pictures are
+ * the one exception: Jellyfin's own, from the server in config.properties (Jellyfin.picture), never an address an app wrote.
  */
 final class WatchArt {
     /** The card in the 1920×1080 layout; the pictures are made at this times the UI's scale (setScale). */
@@ -53,7 +54,8 @@ final class WatchArt {
     private final Map<Bitmap, BitmapShader> shaders = new HashMap<>();   // for the rounded corners, made with the picture
     private final Map<String, Bitmap> cache = new LinkedHashMap<String, Bitmap>(16, 0.75f, true) {
         @Override protected boolean removeEldestEntry(Map.Entry<String, Bitmap> eldest) {
-            if (size() <= 16) return false;   // ~600 KB each at 1080p: the row and a little more
+            // The rows and a little more: 16 at the one row's size (~600 KB each at 1080p), more of the smaller ones.
+            if (size() <= Math.min(28, Math.max(16, 16 * W * H / Math.max(1, pw * ph)))) return false;
             shaders.remove(eldest.getValue());
             return true;
         }
@@ -68,12 +70,12 @@ final class WatchArt {
      * The card's picture, or the app's banner if it has none or it failed; null while loading (in the background;
      * onLoaded runs on the main thread when it's in).
      */
-    Bitmap get(Uri uri, String key, String bannerKey, String pkg) {
-        if (uri != null) {
-            Bitmap b = fetch(key, uri, pkg);
-            if (b != null || !failedRecently(key)) return b;
+    Bitmap get(WatchNext.Item it) {
+        if (it.pictureUri != null || it.jellyfinPicture != null) {
+            Bitmap b = fetch(it.pictureKey, it.pictureUri, it.jellyfinPicture, it.pkg);
+            if (b != null || !failedRecently(it.pictureKey)) return b;
         }
-        return fetch(bannerKey, null, pkg);
+        return fetch(it.bannerKey, null, null, it.pkg);
     }
 
     /** The UI's scale (width / 1920): pictures already made at another size are made again. */
@@ -124,7 +126,7 @@ final class WatchArt {
         }
     }
 
-    private Bitmap fetch(String key, Uri uri, String pkg) {
+    private Bitmap fetch(String key, Uri uri, String jellyfin, String pkg) {
         if (closed) return null;
         synchronized (cache) {
             Bitmap b = cache.get(key);
@@ -137,7 +139,7 @@ final class WatchArt {
             if (closed) return;
             Bitmap b = null;
             try {
-                b = uri == null ? banner(pkg) : load(uri);
+                b = uri != null ? load(read(uri)) : jellyfin != null ? load(Jellyfin.picture(app, jellyfin, pw)) : banner(pkg);
             } catch (IOException | RuntimeException | OutOfMemoryError e) {
                 AppLog.w("continue watching picture: " + e.getMessage());
             }
@@ -159,8 +161,7 @@ final class WatchArt {
         return null;
     }
 
-    private Bitmap load(Uri uri) throws IOException {
-        byte[] data = read(uri);
+    private Bitmap load(byte[] data) throws IOException {
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         BitmapFactory.decodeByteArray(data, 0, data.length, bounds);

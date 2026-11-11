@@ -126,7 +126,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private static String[] tabs;
     private static int tabsGeneration = -1;
     private static final String[] TAB_KIND = {null, "movie", "tv"};
-    private static final int Z_TOP = 4, Z_CARDS = 5, Z_WATCH = 6;
+    private static final int Z_TOP = 4, Z_CARDS = 5, Z_WATCH = 6, Z_RECENT = 12;
 
     private final Activity activity;
     private final Scene scene = new Scene();
@@ -190,15 +190,35 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     // scrolls, Z_WATCH) or nothing. Its texts are measured once per list and its pictures decoded once (WatchArt), so
     // drawing the row costs no more than the picks.
     private String topMode = Prefs.TOP_PICKS;
-    private List<WatchNext.Item> watching = new ArrayList<>();
-    private final Spring[] watchFocus = new Spring[WatchNext.MAX];
-    private final Spring watchScroll = new Spring(0.32f, 1f, 0);
-    private int watchIndex;
+    /** A row of 16:9 cards: Continue Watching, and under it Jellyfin's Recently Added (Z_RECENT) when it's set up. */
+    private static final class CardRow {
+        final int zone;
+        List<WatchNext.Item> items = new ArrayList<>();
+        final Spring[] focus;
+        final Spring scroll = new Spring(0.32f, 1f, 0);
+        int index;
+        String[] titles, metas;
+        float textsK;
+        int textsGen = -1;
+
+        CardRow(int zone, int max) {
+            this.zone = zone;
+            focus = new Spring[max];
+            for (int i = 0; i < max; i++) focus[i] = new Spring(0.32f, 0.78f, 0);
+        }
+
+        /** Where the row scrolls to: the focused card is at most the third on screen. */
+        float scrollTarget() {
+            return Math.max(0, Math.min(index - 2, items.size() - 3));
+        }
+    }
+    private final CardRow watchRow = new CardRow(Z_WATCH, WatchNext.MAX), recentRow = new CardRow(Z_RECENT, Jellyfin.MAX);
     private boolean watchAllowed = true;
     private boolean watchLoaded;   // read at least once: before that, no "nothing half-watched"
-    private String[] watchTitles, watchMetas;
-    private float watchTextsK;
-    private int watchTextsGen = -1;
+    // Jellyfin's row: shown with Continue Watching once its server and key are there (Jellyfin.configured), and then
+    // the cards are smaller, so the two rows and the shelf fit. recentState: Jellyfin.LOADING, OK or FAILED.
+    private boolean threeRows;
+    private int recentState = Jellyfin.LOADING;
     private LinearGradient watchSheen, watchRim;   // focus sheen and rim, made once per card size (not per frame)
     private float watchShaderW;
     private WatchArt watchArt;
@@ -216,6 +236,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private Paint menuTitlePaint, menuSubPaint, menuOptionPaint;
     private final RectF[] cardRects = new RectF[Recs.MAX_CARDS];
     private final List<HomeApps.Item> lightButtons = new ArrayList<>();
+    private Paint lRowTitle, lRowMeta, lRowHead;   // the smaller cards' texts and the rows' headings (three rows)
     private Paint lTitle, lTab, lTabOn, lCardTitle, lCardMeta, lQuote, lTip, lDate, lClock, lWeather, lClockQuote;
     private Shader lightGradient;
     // Continue Watching: the background takes the focused card's colour (worked out once per picture, WatchArt), easing
@@ -420,6 +441,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     }
 
     private final Runnable reloadSoon = this::reload;
+    /** Jellyfin's newest came in (on the main thread): the row shows them. */
+    private final Runnable jellyfinIn = () -> {
+        if (running) reloadSoon();
+    };
     private static final long APPS_MAX_AGE_MS = 15 * 60_000;
     private final LauncherApps launcherApps;
     private boolean appsStale = true;
@@ -657,7 +682,6 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             cardOpen[i] = new Spring(0.32f, 0.78f, i == 0 ? 1 : 0);
             cardRects[i] = new RectF();
         }
-        for (int i = 0; i < watchFocus.length; i++) watchFocus[i] = new Spring(0.32f, 0.78f, 0);
         topMode = Prefs.topContent();
         watchArt = new WatchArt(a, () -> {
             heroDirty = true;
@@ -884,7 +908,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         k = w / 1920f;
         screen.set(0, 0, w, h);
         scene.setSize(w, h);
-        watchArt.setScale(k);
+        watchArt.setScale(k * cardScale());
         makePaints();
         gridLabels = null;
         clockMinute = -1;
@@ -921,6 +945,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         lCardTitle = Ui.text(Ui.semibold, 31 * k, L_INK);
         lCardTitle.setLetterSpacing(0.012f);
         lCardMeta = Ui.text(Ui.medium, 25 * k, L_DIM);
+        lRowTitle = Ui.text(Ui.semibold, 26 * k, L_INK);
+        lRowTitle.setLetterSpacing(0.012f);
+        lRowMeta = Ui.text(Ui.medium, 22 * k, L_DIM);
+        lRowHead = Ui.text(Ui.semibold, 34 * k, L_INK);
         lQuote = Ui.numbers(Ui.regular, 21 * k, L_FAINT);
         lTip = Ui.text(Ui.semibold, 25 * k, L_INK);
         lTip.setTextAlign(Paint.Align.CENTER);
@@ -997,7 +1025,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         boolean statusMoving = step(statusFocus, dt);
         boolean heroMoving = heroFocus.step(dt);
         boolean topMoving = step(topFocus, dt) | topReorderFrame, cardsMoving = step(cardFocus, dt) | step(cardOpen, dt) | cardScroll.step(dt)
-                | step(watchFocus, dt) | watchScroll.step(dt);
+                | step(watchRow.focus, dt) | watchRow.scroll.step(dt) | step(recentRow.focus, dt) | recentRow.scroll.step(dt);
         boolean tintMoving = tintMix.step(dt);
         if (tintMoving) {
             sky.invalidate();
@@ -1417,8 +1445,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     /** Contrast changes only with the background or the day/night text colours. */
     private void applyWatchContrast() {
         int card = blend(tintFrom, tintTo, Ui.clamp(tintMix.value));
-        int behind = plainAt((L_CARDS_TOP + WatchArt.H + 70) * k / Math.max(1, h), card);
-        int quoteBg = plainAt((L_TABBAR_TOP + L_TABBAR_H / 2) * k / Math.max(1, h), card);
+        // Under the (lowest) row's titles, where the text sits on the background.
+        float textY = threeRows ? R2_TOP + WatchArt.H * CARD_SCALE + 50 : L_CARDS_TOP + WatchArt.H + 70;
+        int behind = plainAt(textY * k / Math.max(1, h), card);
+        int quoteBg = plainAt((threeRows ? L_BUTTON_CY : L_TABBAR_TOP + L_TABBAR_H / 2) * k / Math.max(1, h), card);
         int title = lCardTitle.getColor(), meta = lCardMeta.getColor(), quote = lQuote.getColor();
         if (!watchColorsReady || behind != watchTextBg || quoteBg != watchQuoteBg
                 || title != watchTitleInk || meta != watchMetaInk || quote != watchQuoteInk) {
@@ -1764,8 +1794,12 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     /** Coin logo + price in the configured currency, in a row at the right end of the tab bar. */
     private void drawQuotes(Canvas c) {
         boolean clock = clockMode();
-        // At the right margin, under the round buttons: the shelf's glass is narrower and centred with few apps.
+        // At the right margin, under the round buttons: the shelf's glass is narrower and centred with few apps. With
+        // three rows the first row is there: on the title's line instead, left of the buttons.
         float right = CONTENT_R * k;
+        boolean onTitle = !clock && threeRows && continueMode();
+        if (onTitle && !lightButtons.isEmpty()) right = topRects[3].left - 28 * k;
+        if (onTitle && !sleepText.isEmpty()) right -= lQuote.measureText(sleepText) + lQuote.getTextSize() * 2.4f;   // the sleep timer's there
         applyTone();
         Paint text = clock ? lClockQuote : lQuote;
         // The corner buttons' names appear in this row: the quotes fade out while one of them has focus.
@@ -1778,7 +1812,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         String line = clock ? playingClock : playingTab;
         if (line != null) {
             float cap = clock ? playingClockCap : playingTabCap, gap = cap * 0.6f;
-            float base = clock ? L_QUOTES_BASE * k : (L_TABBAR_TOP + L_TABBAR_H / 2) * k + cap / 2;
+            float base = clock ? L_QUOTES_BASE * k : (onTitle ? L_BUTTON_CY : L_TABBAR_TOP + L_TABBAR_H / 2) * k + cap / 2;
             float x = clock ? MARGIN * k : right - playingTabWidth - gap - NowPlaying.barsWidth(cap);
             NowPlaying.drawBars(c, x, base, cap, text, SystemClock.uptimeMillis() < barsUntil, barRect);
             c.drawText(line, x + NowPlaying.barsWidth(cap) + gap, base, text);
@@ -1796,7 +1830,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             q = quotes = new Quotes(coins, data.prices, text);
         }
         // On the tab row, at the right.
-        float base = clock ? L_QUOTES_BASE * k : (L_TABBAR_TOP + L_TABBAR_H / 2) * k + q.halfCap;
+        float base = clock ? L_QUOTES_BASE * k : (onTitle ? L_BUTTON_CY : L_TABBAR_TOP + L_TABBAR_H / 2) * k + q.halfCap;
         float cap = q.cap, gap = (clock ? 8 : 6) * k, spacing = (clock ? 32 : 24) * k;
         float total = spacing * (n - 1);
         for (int i = 0; i < n; i++) total += q.glyphs[i] + gap + q.widths[i];
@@ -2399,14 +2433,16 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             handler.removeCallbacks(bgFollow);
             handler.postDelayed(bgFollow, BG_FOLLOW_MS);
         }
-        heroChanged |= aim(watchFocus, !sheetOpen && zone == Z_WATCH ? watchIndex : -1, snap);
-        updateTint();
-        // The row scrolls so the focused card is at most the third one on screen.
-        float watchTo = Math.max(0, Math.min(watchIndex - 2, watching.size() - 3));
-        if (watchScroll.target != watchTo || snap) {
-            heroChanged = true;
-            if (snap) watchScroll.snap(watchTo); else watchScroll.target = watchTo;
+        for (CardRow row : new CardRow[] {watchRow, recentRow}) {
+            heroChanged |= aim(row.focus, !sheetOpen && zone == row.zone ? row.index : -1, snap);
+            // The row scrolls so the focused card is at most the third one on screen.
+            float to = row.scrollTarget();
+            if (row.scroll.target != to || snap) {
+                heroChanged = true;
+                if (snap) row.scroll.snap(to); else row.scroll.target = to;
+            }
         }
+        updateTint();
         statusChanged |= topChanged;
         tilesDirty |= snap || tilesChanged;
         statusDirty |= snap || statusChanged;
@@ -2664,12 +2700,19 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             // Only read when it's shown: with the picks or the clock, Continue Watching costs nothing.
             final String mode = Prefs.topContent();
             final boolean allowed = WatchNext.allowed(c);
-            final List<WatchNext.Item> w = mode.equals(Prefs.TOP_CONTINUE) ? WatchNext.load(c) : new ArrayList<>();
+            final boolean jellyfin = mode.equals(Prefs.TOP_CONTINUE) && Jellyfin.configured(c);
+            // Jellyfin's cards there with the episode's own picture (the app publishes the show's), once it's known.
+            final List<WatchNext.Item> w = !mode.equals(Prefs.TOP_CONTINUE) ? new ArrayList<>()
+                    : jellyfin ? Jellyfin.episodePictures(c, WatchNext.load(c), jellyfinIn) : WatchNext.load(c);
+            // Jellyfin's newest: what's in memory now; a refresh runs on its own thread and reloads when it's in.
+            final List<WatchNext.Item> latest = jellyfin ? Jellyfin.latest(c, jellyfinIn) : new ArrayList<>();
+            final int latestState = Jellyfin.state();
             handler.post(() -> {
                 // A provider/package refresh must not cancel a drag or undo a move that was just saved.
                 boolean keepOrder = reordering || pendingOrderSaves > 0 || orderAtLoad != orderRevision;
                 if (top != null && !keepOrder) setLightButtons(top);
                 setTopContent(mode, w, allowed);
+                setRecent(jellyfin, latest, latestState);
                 if (s != null && !keepOrder) setShelf(s);
                 if (apps && keepOrder) appsStale = true;
                 setStatusItems(st);
@@ -2778,14 +2821,18 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         }
         if (hit < 0) {
             z = Z_WATCH;
-            hit = watchAt(x, y, true);
+            hit = rowAt(watchRow, x, y, true);
+        }
+        if (hit < 0) {
+            z = Z_RECENT;
+            hit = rowAt(recentRow, x, y, true);
         }
         if (hit < 0) {
             z = Z_SHELF;
             hit = tileAt(x, y);
         }
         if (!entered(z, hit)) return;
-        int now = zone == Z_TOP ? topIndex : zone == Z_CARDS ? cardIndex : zone == Z_WATCH ? watchIndex : shelfIndex;
+        int now = zone == Z_TOP ? topIndex : zone == Z_CARDS ? cardIndex : rowOf(zone) != null ? rowOf(zone).index : shelfIndex;
         if (zone == z && now == hit) return;
         zone = z;
         if (z == Z_TOP) {
@@ -2793,8 +2840,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             if (hit < 3) selectTab(hit);   // as with the arrows (and on LG): focusing a tab selects it
         } else if (z == Z_CARDS) {
             cardIndex = hit;
-        } else if (z == Z_WATCH) {
-            watchIndex = hit;
+        } else if (rowOf(z) != null) {
+            rowOf(z).index = hit;
         } else {
             shelfIndex = hit;
         }
@@ -2826,10 +2873,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 cardIndex = next;
                 retarget(false);
             }
-        } else if (zone == Z_WATCH && !watching.isEmpty()) {
-            int next = Math.max(0, Math.min(watching.size() - 1, watchIndex + dir));
-            if (next != watchIndex) {
-                watchIndex = next;
+        } else if (rowOf(zone) != null && !rowOf(zone).items.isEmpty()) {
+            CardRow row = rowOf(zone);
+            int next = Math.max(0, Math.min(row.items.size() - 1, row.index + dir));
+            if (next != row.index) {
+                row.index = next;
                 retarget(false);
             }
         } else if (!shelf.isEmpty()) {
@@ -2894,10 +2942,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             activate();
             return;
         }
-        hit = watchAt(x, y, false);
-        if (hit >= 0) {
-            zone = Z_WATCH;
-            watchIndex = hit;
+        for (CardRow row : new CardRow[] {watchRow, recentRow}) {
+            hit = rowAt(row, x, y, false);
+            if (hit < 0) continue;
+            zone = row.zone;
+            row.index = hit;
             retarget(false);
             activate();
             return;
@@ -2941,16 +2990,26 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         return still && Math.max(0, hit - 2) != cardScroll.target ? -1 : hit;
     }
 
-    /** The Continue Watching card under a point, if any (only the ones on screen; `still` as in cardAt). */
-    private int watchAt(float x, float y, boolean still) {
-        if (!continueMode()) return -1;
-        for (int i = 0; i < watching.size(); i++) {
-            watchRect(i, hitBox);
+    /** A row's card under a point, if any (only the ones on screen; `still` as in cardAt). */
+    private int rowAt(CardRow row, float x, float y, boolean still) {
+        if (!rowShown(row)) return -1;
+        for (int i = 0; i < row.items.size(); i++) {
+            rowRect(row, i, hitBox);
             if (hitBox.left > w || hitBox.right <= watchLeftEdge()) continue;
             if (!hitBox.contains(x, y)) continue;
-            return still && Math.max(0, Math.min(i - 2, watching.size() - 3)) != watchScroll.target ? -1 : i;
+            return still && row.scrollTarget() != row.scroll.target ? -1 : i;
         }
         return -1;
+    }
+
+    /** The row for a zone (Z_WATCH, Z_RECENT), or null. */
+    private CardRow rowOf(int zone) {
+        return zone == Z_WATCH ? watchRow : zone == Z_RECENT ? recentRow : null;
+    }
+
+    /** Continue Watching shows with its setting; Recently Added with it, once Jellyfin is set up. */
+    private boolean rowShown(CardRow row) {
+        return continueMode() && (row == watchRow || threeRows);
     }
 
     /**
@@ -3273,10 +3332,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             }
             it = lightButtons.get(topIndex - 3);
             r = topRects[topIndex];
-        } else if (zone == Z_WATCH) {
-            if (watchIndex >= watching.size()) return;
+        } else if (rowOf(zone) != null) {
+            CardRow row = rowOf(zone);
+            if (row.index >= row.items.size()) return;
             click.open();
-            openWatching(watching.get(watchIndex));
+            openWatching(row.items.get(row.index));
             return;
         } else if (zone == Z_CARDS) {
             Recs.Pick p = cardIndex < cards.size() ? cards.get(cardIndex) : null;
@@ -3657,7 +3717,9 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         }
         for (int i = picksMode() ? 0 : 3; i < 3 + lightButtons.size(); i++) out.add(a11yId(Z_TOP, i));
         for (int i = 0; i < Math.min(Recs.MAX_CARDS, cards.size()); i++) out.add(a11yId(Z_CARDS, i));
-        if (continueMode()) for (int i = 0; i < watching.size(); i++) out.add(a11yId(Z_WATCH, i));
+        for (CardRow row : new CardRow[] {watchRow, recentRow}) {
+            if (rowShown(row)) for (int i = 0; i < row.items.size(); i++) out.add(a11yId(row.zone, i));
+        }
         for (int i = shelfFirst; i < Math.min(shelf.size(), shelfFirst + shelfVisible); i++) out.add(a11yId(Z_SHELF, i));
         for (int i = 0; i < drawerItems.size(); i++) out.add(a11yId(Z_DRAWER, i));
         if (drawerOpen && Prefs.weather()) out.add(a11yId(WIDGETS, 0));
@@ -3686,8 +3748,9 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 return Ui.trf("{name}, tab {i} of {n}", "name", tabs()[i], "i", i + 1, "n", 3);
             case Z_CARDS: return i < cards.size() ? pickText(cards.get(i)) : "";
             case Z_WATCH:
-                if (i >= watching.size()) return "";
-                WatchNext.Item it = watching.get(i);
+            case Z_RECENT:
+                if (i >= rowOf(group).items.size()) return "";
+                WatchNext.Item it = rowOf(group).items.get(i);
                 String left = timeLeft(it);
                 return it.title + (it.episode != null ? ", " + it.episode : "") + (left != null ? ", " + left : "")
                         + (it.app != null && !it.app.isEmpty() ? ". " + Ui.trf("App: {app}", "app", it.app) : "");
@@ -3742,8 +3805,9 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 dy = heroLayer.getTranslationY();
                 break;
             case Z_WATCH:
-                if (i >= watching.size()) return false;
-                watchRect(i, a11yRect);
+            case Z_RECENT:
+                if (i >= rowOf(group).items.size()) return false;
+                rowRect(rowOf(group), i, a11yRect);
                 dy = heroLayer.getTranslationY();
                 break;
             case Z_SHELF:
@@ -3785,7 +3849,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             return !reordering && !menuOpen && !sheetOpen && shelf.size() > 1 && i < shelf.size()
                     && shelf.get(i).kind == HomeApps.APP && shelf.get(i).pkg != null;
         }
-        return group == Z_WATCH && !menuOpen && continueMode() && i < watching.size();
+        return group == Z_WATCH && !menuOpen && continueMode() && i < watchRow.items.size();
     }
 
     private int a11yFocused() {
@@ -3795,7 +3859,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         switch (zone) {
             case Z_TOP: return a11yId(Z_TOP, topIndex);
             case Z_CARDS: return cardIndex < cards.size() ? a11yId(Z_CARDS, cardIndex) : -1;
-            case Z_WATCH: return watchIndex < watching.size() ? a11yId(Z_WATCH, watchIndex) : -1;
+            case Z_WATCH:
+            case Z_RECENT: return rowOf(zone).index < rowOf(zone).items.size() ? a11yId(zone, rowOf(zone).index) : -1;
             case Z_SHELF: return shelf.isEmpty() ? -1 : a11yId(Z_SHELF, shelfIndex);
             case Z_DRAWER: return drawerItems.isEmpty() ? -1 : a11yId(Z_DRAWER, drawerIndex);
             case WIDGETS: return a11yId(WIDGETS, widgetIndex);
@@ -3878,9 +3943,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 cardIndex = i;
                 break;
             case Z_WATCH:
-                if (i >= watching.size()) return;
+            case Z_RECENT:
+                if (i >= rowOf(group).items.size()) return;
                 if (drawerOpen) closeDrawer();
-                watchIndex = i;
+                rowOf(group).index = i;
                 break;
             case Z_SHELF:
                 if (i >= shelf.size()) return;
@@ -4068,7 +4134,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             list = shown;
         }
         boolean modeChanged = !mode.equals(topMode);
-        boolean listChanged = !sameWatching(list, watching);
+        boolean listChanged = !sameWatching(list, watchRow.items);
         // The permission (granted or taken back) and the first read change what an empty row says: redraw for those.
         boolean textChanged = allowed != watchAllowed || !watchLoaded && mode.equals(Prefs.TOP_CONTINUE);
         watchAllowed = allowed;
@@ -4079,9 +4145,9 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         }
         topMode = mode;
         if (modeChanged) closeMenu(false);
-        watching = list;
-        watchTitles = null;
-        watchIndex = Math.min(watchIndex, Math.max(0, list.size() - 1));
+        watchRow.items = list;
+        watchRow.titles = null;
+        watchRow.index = Math.min(watchRow.index, Math.max(0, list.size() - 1));
         boolean lost = zone == Z_WATCH && list.isEmpty() || !picksMode() && (zone == Z_CARDS || zone == Z_TOP && topIndex < 3);
         if (modeChanged || lost) zone = Z_SHELF;
         if (modeChanged) {
@@ -4091,6 +4157,25 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         }
         retarget(modeChanged);
         heroDirty = true;
+    }
+
+    /** Jellyfin's Recently Added (from reload): its row, and whether it's there at all (the smaller cards with it). */
+    private void setRecent(boolean on, List<WatchNext.Item> list, int state) {
+        boolean layoutChanged = on != threeRows;
+        if (!layoutChanged && state == recentState && sameWatching(list, recentRow.items)) return;
+        threeRows = on;
+        recentState = state;
+        recentRow.items = list;
+        recentRow.titles = null;
+        recentRow.index = Math.min(recentRow.index, Math.max(0, list.size() - 1));
+        if (zone == Z_RECENT && (list.isEmpty() || !on)) zone = Z_SHELF;
+        if (layoutChanged) {
+            watchRow.titles = null;   // measured again for the new card width
+            watchArt.setScale(k * cardScale());
+        }
+        retarget(layoutChanged);
+        heroDirty = true;
+        wake();
     }
 
     private static boolean sameWatching(List<WatchNext.Item> a, List<WatchNext.Item> b) {
@@ -4105,31 +4190,51 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         return true;
     }
 
-    /** Card i's place on screen (without its focus growth), scrolled with the row. */
-    private void watchRect(int i, RectF out) {
-        float step = (WatchArt.W + WATCH_GAP) * k;
-        float x = MARGIN * k + i * step - watchScroll.value * step, y = L_CARDS_TOP * k;
-        out.set(x, y, x + WatchArt.W * k, y + WatchArt.H * k);
+    // Three rows (with Jellyfin): the cards at CARD_SCALE, Continue Watching from R1_TOP, Recently Added's heading on
+    // R2_HEAD and its cards from R2_TOP, and "Favorite Apps" on APPS_HEAD, just above the shelf's glass (L_PLATTER_TOP).
+    private static final float CARD_SCALE = 0.58f, R1_TOP = 180, R2_HEAD = 476, R2_TOP = 498, APPS_HEAD = 790;
+
+    /** The cards' size against WatchArt's (1 with the one row of Continue Watching). */
+    private float cardScale() {
+        return threeRows ? CARD_SCALE : 1;
+    }
+
+    private Paint rowTitlePaint() {
+        return threeRows ? lRowTitle : lCardTitle;
+    }
+
+    private Paint rowMetaPaint() {
+        return threeRows ? lRowMeta : lCardMeta;
+    }
+
+    /** Card i's place on screen (without its focus growth), scrolled with its row. */
+    private void rowRect(CardRow row, int i, RectF out) {
+        float cs = cardScale(), cw = WatchArt.W * cs * k, ch = WatchArt.H * cs * k;
+        float step = cw + (threeRows ? 32 : WATCH_GAP) * k;
+        float x = MARGIN * k + (i - row.scroll.value) * step;
+        float y = (!threeRows ? L_CARDS_TOP : row == watchRow ? R1_TOP : R2_TOP) * k;
+        out.set(x, y, x + cw, y + ch);
     }
 
     /** Each card's title and details line ("Netflix · S2 E5 · 23 min left"), cut to the card's width once per list. */
-    private void prepareWatchTexts() {
-        int n = watching.size();
-        watchTitles = new String[n];
-        watchMetas = new String[n];
-        TextPaint tp = new TextPaint(lCardTitle), mp = new TextPaint(lCardMeta);
-        float width = WatchArt.W * k;
+    private void prepareRowTexts(CardRow row) {
+        int n = row.items.size();
+        row.titles = new String[n];
+        row.metas = new String[n];
+        TextPaint tp = new TextPaint(rowTitlePaint()), mp = new TextPaint(rowMetaPaint());
+        float width = WatchArt.W * cardScale() * k;
         for (int i = 0; i < n; i++) {
-            WatchNext.Item it = watching.get(i);
-            watchTitles[i] = TextUtils.ellipsize(it.title, tp, width, TextUtils.TruncateAt.END).toString();
-            StringBuilder meta = new StringBuilder(it.app == null ? "" : it.app);
+            WatchNext.Item it = row.items.get(i);
+            row.titles[i] = TextUtils.ellipsize(it.title, tp, width, TextUtils.TruncateAt.END).toString();
+            // Recently Added's cards are all Jellyfin's: no app name on them.
+            StringBuilder meta = new StringBuilder(it.app == null || row == recentRow ? "" : it.app);
             if (it.episode != null) meta.append(meta.length() > 0 ? " · " : "").append(it.episode);
             String left = timeLeft(it);
             if (left != null) meta.append(meta.length() > 0 ? " · " : "").append(left);
-            watchMetas[i] = TextUtils.ellipsize(meta.toString(), mp, width, TextUtils.TruncateAt.END).toString();
+            row.metas[i] = TextUtils.ellipsize(meta.toString(), mp, width, TextUtils.TruncateAt.END).toString();
         }
-        watchTextsK = k;
-        watchTextsGen = Ui.generation;
+        row.textsK = k;
+        row.textsGen = Ui.generation;
     }
 
     private static String timeLeft(WatchNext.Item it) {
@@ -4139,22 +4244,44 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     }
 
     private void drawWatchRow(Canvas c) {
-        if (watching.isEmpty()) {
-            if (!watchLoaded) return;   // not read yet: saying "nothing" now could be wrong
-            String text = watchAllowed ? Ui.tr("Nothing half-watched in your apps.")
-                    : Ui.tr("Missing permission: pick Continue Watching again in Home Settings.");
-            c.drawText(text, MARGIN * k, (L_CARDS_TOP + 60) * k, lCardMeta);
+        drawRow(c, watchRow);
+        if (!threeRows) return;
+        // The headings take the card titles' colour, which applyWatchContrast keeps readable on the background.
+        lRowHead.setColor(lCardTitle.getColor());
+        String added = Ui.tr("Recently Added"), apps = Ui.tr("Favorite Apps");
+        c.drawText(added, MARGIN * k - Ui.leftBearing(lRowHead, added), R2_HEAD * k, lRowHead);
+        c.drawText(apps, MARGIN * k - Ui.leftBearing(lRowHead, apps), APPS_HEAD * k, lRowHead);
+        drawRow(c, recentRow);
+    }
+
+    private void drawRow(Canvas c, CardRow row) {
+        if (row.items.isEmpty()) {
+            String text;
+            if (row == watchRow) {
+                if (!watchLoaded) return;   // not read yet: saying "nothing" now could be wrong
+                text = watchAllowed ? Ui.tr("Nothing half-watched in your apps.")
+                        : Ui.tr("Missing permission: pick Continue Watching again in Home Settings.");
+            } else {
+                if (recentState == Jellyfin.LOADING) return;
+                text = recentState == Jellyfin.FAILED ? Ui.trf("Couldn't reach {app}.", "app", "Jellyfin")
+                        : Ui.trf("Nothing new in {app}.", "app", "Jellyfin");
+            }
+            rowRect(row, 0, tmp);
+            Paint p = rowMetaPaint();
+            c.drawText(text, MARGIN * k, tmp.top + (threeRows ? 44 : 60) * k, p);
             return;
         }
-        if (watchTitles == null || watchTextsK != k || watchTextsGen != Ui.generation) prepareWatchTexts();
+        if (row.titles == null || row.textsK != k || row.textsGen != Ui.generation) prepareRowTexts(row);
+        lRowTitle.setColor(lCardTitle.getColor());
+        lRowMeta.setColor(lCardMeta.getColor());
         int top = -1;
-        for (int i = 0; i < watching.size(); i++) if (watchFocus[i].value > 0.02f && (top < 0 || watchFocus[i].value > watchFocus[top].value)) top = i;
+        for (int i = 0; i < row.items.size(); i++) if (row.focus[i].value > 0.02f && (top < 0 || row.focus[i].value > row.focus[top].value)) top = i;
         // Cards scrolled past the left margin slide out under this edge instead of leaving a sliver there (the first
         // card's focus growth and shadow still fit).
         c.save();
         c.clipRect(watchLeftEdge(), 0, w, h);
-        for (int i = 0; i < watching.size(); i++) if (i != top) drawWatchCard(c, i);
-        if (top >= 0) drawWatchCard(c, top);
+        for (int i = 0; i < row.items.size(); i++) if (i != top) drawWatchCard(c, row, i);
+        if (top >= 0) drawWatchCard(c, row, top);
         c.restore();
     }
 
@@ -4185,12 +4312,12 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     }
 
     /** Like a pick's card (same focus, shadow, sheen and rim), with the progress bar on the picture. */
-    private void drawWatchCard(Canvas c, int i) {
-        watchRect(i, cell);
+    private void drawWatchCard(Canvas c, CardRow row, int i) {
+        rowRect(row, i, cell);
         if (cell.left > w || cell.right <= watchLeftEdge()) return;   // scrolled off screen
-        WatchNext.Item it = watching.get(i);
-        float v = watchFocus[i].value, f = Ui.clamp(v), s = 1 + 0.05f * v;
-        float bw = cell.width(), bh = cell.height(), r0 = 18 * k, r = r0 * s;
+        WatchNext.Item it = row.items.get(i);
+        float v = row.focus[i].value, f = Ui.clamp(v), s = 1 + 0.05f * v;
+        float bw = cell.width(), bh = cell.height(), r0 = (threeRows ? 14 : 18) * k, r = r0 * s;
         float cx = cell.centerX(), cy = cell.centerY() - 6 * k * v, textLeft = cell.left, textTop = cell.bottom;
         c.save();
         c.translate(cx, cy);
@@ -4201,7 +4328,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         shadows.draw(c, tmp, r0, DEEP_BLUR * k, shadowDeep);
         c.restore();
         cell.set(cx - bw * s / 2, cy - bh * s / 2, cx + bw * s / 2, cy + bh * s / 2);
-        Bitmap img = watchArt.get(it.pictureUri, it.pictureKey, it.bannerKey, it.pkg);
+        Bitmap img = watchArt.get(it);
         if (img != null) {
             roundImage(c, img, watchArt.shader(img), cell, r);
         } else {
@@ -4244,8 +4371,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             rim.setAlpha(255);
             c.restore();
         }
-        c.drawText(watchTitles[i], textLeft, textTop + 46 * k, lCardTitle);
-        if (!watchMetas[i].isEmpty()) c.drawText(watchMetas[i], textLeft, textTop + 80 * k, lCardMeta);
+        c.drawText(row.titles[i], textLeft, textTop + (threeRows ? 36 : 46) * k, rowTitlePaint());
+        if (!row.metas[i].isEmpty()) c.drawText(row.metas[i], textLeft, textTop + (threeRows ? 64 : 80) * k, rowMetaPaint());
     }
 
     /** Resumes it where you left it (the app's own link); if that link can't be used, the app itself. */
@@ -4305,13 +4432,13 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     // MARK: - Continue Watching: the menu of a held card
 
     private boolean canHold() {
-        return zone == Z_WATCH && !sheetOpen && !drawerOpen && continueMode() && watchIndex < watching.size();
+        return zone == Z_WATCH && !sheetOpen && !drawerOpen && continueMode() && watchRow.index < watchRow.items.size();
     }
 
     /** The focused card's menu (held OK, or TalkBack's long click). */
     private void showMenu() {
         if (menuOpen || !canHold() || menuTitlePaint == null) return;
-        menuItem = watching.get(watchIndex);
+        menuItem = watchRow.items.get(watchRow.index);
         float width = (MENU_W - 2 * MENU_PAD) * k;
         String title = menuItem.title + (menuItem.episode != null ? " · " + menuItem.episode : "");
         menuTitle = TextUtils.ellipsize(title, new TextPaint(menuTitlePaint), width, TextUtils.TruncateAt.END).toString();
@@ -4432,11 +4559,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         hidden.add(key);
         Prefs.setWatchHidden(hidden);
         hiddenNow.add(key);
-        List<WatchNext.Item> list = new ArrayList<>(watching.size());
-        for (WatchNext.Item x : watching) if (!key.equals(WatchNext.hideKey(x))) list.add(x);
-        watching = list;
-        watchTitles = null;
-        watchIndex = Math.min(watchIndex, Math.max(0, list.size() - 1));
+        List<WatchNext.Item> list = new ArrayList<>(watchRow.items.size());
+        for (WatchNext.Item x : watchRow.items) if (!key.equals(WatchNext.hideKey(x))) list.add(x);
+        watchRow.items = list;
+        watchRow.titles = null;
+        watchRow.index = Math.min(watchRow.index, Math.max(0, list.size() - 1));
         if (list.isEmpty() && zone == Z_WATCH) zone = Z_SHELF;
         retarget(false);
         heroDirty = true;
@@ -4546,7 +4673,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
 
     /** The colour to ease toward: the focused card's (or the last one focused), once its picture is in. */
     private void updateTint() {
-        if (!continueMode() || watching.isEmpty()) {
+        // The row with the focus, else Continue Watching, else Recently Added.
+        CardRow row = zone == Z_RECENT && !recentRow.items.isEmpty() || watchRow.items.isEmpty() && threeRows
+                ? recentRow : watchRow;
+        if (!continueMode() || row.items.isEmpty()) {
             if (tinted) {
                 tinted = false;
                 tintFrom = tintTo = TINT_WAIT;
@@ -4557,7 +4687,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             }
             return;
         }
-        WatchNext.Item it = watching.get(Math.min(watchIndex, watching.size() - 1));
+        WatchNext.Item it = row.items.get(Math.min(row.index, row.items.size() - 1));
         Integer color = watchArt.color(it.pictureKey, it.bannerKey);
         if (color == null || tinted && color == tintTo) return;
         // The first colour eases in from TINT_WAIT like any other change: no jump when the pictures arrive.
@@ -4846,9 +4976,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 // Up from an empty shelf too: move()'s older zones (the hero, the corner capsule) aren't drawn any more.
                 if (dy >= 0) return false;
                 if (!picksMode()) {
-                    // No tabs or picks: up goes to what you were watching, or to the corner buttons.
-                    if (continueMode() && !watching.isEmpty()) {
-                        zone = Z_WATCH;
+                    // No tabs or picks: up goes to the rows of cards (Recently Added first), or to the corner buttons.
+                    CardRow above = rowAbove(null);
+                    if (above != null) {
+                        enterRow(above, shelf.isEmpty() ? w / 2f : tileRects[shelfIndex].centerX());
                     } else if (!lightButtons.isEmpty()) {
                         zone = Z_TOP;
                         topIndex = 3;
@@ -4880,22 +5011,40 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 }
                 break;
             case Z_WATCH:
+            case Z_RECENT: {
+                CardRow row = rowOf(zone);
+                rowRect(row, Math.min(row.index, Math.max(0, row.items.size() - 1)), hitBox);
+                float x = hitBox.centerX();
                 if (dx != 0) {
-                    int next = Math.max(0, Math.min(watching.size() - 1, watchIndex + dx));
-                    if (next == watchIndex) return true;
-                    watchIndex = next;
+                    int next = Math.max(0, Math.min(row.items.size() - 1, row.index + dx));
+                    if (next == row.index) return true;
+                    row.index = next;
                 } else if (dy < 0) {
-                    if (lightButtons.isEmpty()) return true;
-                    zone = Z_TOP;
-                    topIndex = 3;
+                    CardRow above = rowAbove(row);
+                    if (above != null) {
+                        enterRow(above, x);
+                    } else {
+                        if (lightButtons.isEmpty()) return true;
+                        zone = Z_TOP;
+                        topIndex = 3;
+                    }
                 } else {
-                    zone = Z_SHELF;
+                    CardRow below = rowBelow(row);
+                    if (below != null) {
+                        enterRow(below, x);
+                    } else {
+                        zone = Z_SHELF;
+                        if (!shelf.isEmpty()) shelfIndex = nearest(tileRects, tileRects.length, x);
+                    }
                 }
                 break;
+            }
             case Z_TOP:
                 if (dx != 0 && !picksMode() && topIndex + dx < 3) return true;   // no tabs to the left
                 if (dy > 0 && !picksMode()) {
-                    zone = continueMode() && !watching.isEmpty() ? Z_WATCH : Z_SHELF;
+                    CardRow below = rowBelow(null);
+                    if (below != null) enterRow(below, topRects[topIndex].centerX());
+                    else zone = Z_SHELF;
                     break;
                 }
                 if (dx != 0) {
@@ -4922,6 +5071,44 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         retarget(false);
         click.move();
         return true;
+    }
+
+    /** The rows that can take the focus (shown, with cards), top to bottom. */
+    private List<CardRow> focusRows() {
+        List<CardRow> out = new ArrayList<>(2);
+        for (CardRow row : new CardRow[] {watchRow, recentRow}) if (rowShown(row) && !row.items.isEmpty()) out.add(row);
+        return out;
+    }
+
+    /** The row above `row` (null: from the shelf, the lowest one), or null. */
+    private CardRow rowAbove(CardRow row) {
+        List<CardRow> rows = focusRows();
+        int i = row == null ? rows.size() : rows.indexOf(row);
+        return i > 0 ? rows.get(i - 1) : null;
+    }
+
+    /** The row below `row` (null: from the top, the first one), or null. */
+    private CardRow rowBelow(CardRow row) {
+        List<CardRow> rows = focusRows();
+        int i = row == null ? -1 : rows.indexOf(row);
+        return i + 1 < rows.size() && (row == null || i >= 0) ? rows.get(i + 1) : null;
+    }
+
+    /** Focuses the row's card on screen nearest to `x` (the column you came from). */
+    private void enterRow(CardRow row, float x) {
+        int best = Math.min(row.index, row.items.size() - 1);
+        float bestDistance = Float.MAX_VALUE;
+        for (int i = 0; i < row.items.size(); i++) {
+            rowRect(row, i, hitBox);
+            if (hitBox.left > w || hitBox.right <= watchLeftEdge()) continue;
+            float d = Math.abs(hitBox.centerX() - x);
+            if (d < bestDistance) {
+                bestDistance = d;
+                best = i;
+            }
+        }
+        zone = row.zone;
+        row.index = Math.max(0, best);
     }
 
     private static int nearest(RectF[] rects, int count, float x) {
