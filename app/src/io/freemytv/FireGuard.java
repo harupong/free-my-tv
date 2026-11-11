@@ -51,10 +51,10 @@ import android.view.accessibility.AccessibilityEvent;
  * refuses a start from an app without a visible window, so the launch waits for the cover's first draw; Android 14
  * counts the cover a frame or more after that ({@link #SHOWN_DELAY_MS}).
  *
- * Turned off, a Fire OS TV restarts quietly into standby, and Amazon's home can be up before this service is: no
- * window event comes, and HOME on Amazon's home sends none either. So until it has seen a window, in the first minutes
- * after a start, it takes the screen for Amazon's home: when the screen comes on (or is on as it connects), and no
- * window shows up for {@link #SETTLE_MS} (a TV that starts on an input has its player's), ours comes up.
+ * Amazon's home is often up before this service is (a start, an update of this app, a rebind): no window event comes,
+ * and HOME on Amazon's home sends none either, so it stayed there through HOME presses and standby (an AFTKA, Fire OS
+ * 7.7). Until it has seen a window, it takes the screen for Amazon's home: when the screen is on as it connects, or
+ * comes on, and no window shows up for {@link #SETTLE_MS} (a TV that starts on an input has its player's), ours comes up.
  */
 public class FireGuard extends AccessibilityService {
     private static final String AMAZON = "com.amazon.tv.launcher";
@@ -64,7 +64,6 @@ public class FireGuard extends AccessibilityService {
     private static final long LAUNCH_FALLBACK_MS = 150;
     private static final long SHOWN_DELAY_MS = Build.VERSION.SDK_INT >= 34 ? 300 : 0;
     private static final long REPEAT_MS = 1000;          // a burst of HOME presses opens ours once a second at most
-    private static final long BOOT_MS = 5 * 60_000;      // connected this soon after a start: Amazon's home is in front
     private static final long SETTLE_MS = 1200;
     private static final long SLOW_COVER_MS = 6500;      // alarms not at once yet (5 s): the cover waits for the launch
 
@@ -74,14 +73,14 @@ public class FireGuard extends AccessibilityService {
     private final Runnable retry = this::retryHome;
     private final Runnable bootHome = this::bootHome;
     private View cover;
-    private boolean onAmazonHome, pending, seen, afterBoot;
+    private boolean onAmazonHome, pending, seen;
     private long lastLaunch = -REPEAT_MS;
 
     /** Waking from standby resumes what was on screen with no window event: Amazon's home gets replaced then too. */
     private final BroadcastReceiver screenOn = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
             if (onAmazonHome) launchWhenCovered();
-            else if (afterBoot && !seen) settle();
+            else if (!seen) settle();
         }
     };
 
@@ -106,9 +105,8 @@ public class FireGuard extends AccessibilityService {
             AppLog.w("fire guard: no cover (" + e.getMessage() + ")");   // the launch still works, Amazon's home flashes by
         }
         registerReceiver(screenOn, new IntentFilter(Intent.ACTION_SCREEN_ON));
-        afterBoot = SystemClock.elapsedRealtime() < BOOT_MS;
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
-        if (afterBoot && power != null && power.isInteractive()) settle();
+        if (power != null && power.isInteractive()) settle();
     }
 
     private void settle() {
@@ -116,10 +114,10 @@ public class FireGuard extends AccessibilityService {
         handler.postDelayed(bootHome, SETTLE_MS);
     }
 
-    /** No window seen since the start: what's on screen is Amazon's home. */
+    /** No window seen since this service connected: what's on screen is Amazon's home. */
     private void bootHome() {
         if (seen) return;
-        AppLog.w("fire guard: Amazon's home at start, ours over it");
+        AppLog.w("fire guard: no window seen yet, ours over Amazon's home");
         onAmazonHome = true;
         launchWhenCovered();
     }
