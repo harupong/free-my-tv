@@ -40,7 +40,7 @@ final class WatchNext {
         String intent;
         final Uri pictureUri;
         final String pictureKey, bannerKey;
-        /** A picture on the Jellyfin server (its path there, Recently Added's cards), which WatchArt asks Jellyfin for. */
+        /** A picture on the Jellyfin server (its path there, Jellyfin's rows), which WatchArt asks Jellyfin for. */
         final String jellyfinPicture;
         private final String picture;
 
@@ -63,19 +63,6 @@ final class WatchNext {
             jellyfinPicture = path;
             pictureKey = path == null ? null : "jellyfin:" + path;
             bannerKey = "banner:" + pkg;
-        }
-
-        /** The same card with a picture from the Jellyfin server instead (Jellyfin.episodePictures). */
-        Item withJellyfinPicture(String path) {
-            Item it = new Item(pkg, path, true);
-            it.title = title;
-            it.episode = episode;
-            it.app = app;
-            it.duration = duration;
-            it.position = position;
-            it.engaged = engaged;
-            it.intent = intent;
-            return it;
         }
 
         /** The picture for a 16:9 card: the thumbnail (usually 16:9) before the poster. */
