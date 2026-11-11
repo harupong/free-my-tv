@@ -24,8 +24,8 @@ import java.util.concurrent.Executors;
  * Recently Added, from your Jellyfin server (jellyfin_server in config.properties, its key sent to each TV by
  * tools/send_key.py into Secrets, never in the APK): the newest items of the key's user (or of jellyfin_user, for an
  * API key made in the dashboard), read on their own thread when the home screen comes back, at most every few minutes.
- * OK opens the item in Jellyfin's Android TV app, and Continue Watching's Jellyfin cards get the episode's own picture
- * from here (episodePictures). A TV without the key keeps the one row of Continue Watching.
+ * OK opens the item in Jellyfin's Android TV app. With it, Continue Watching's row becomes Recently Watched: what the
+ * user played last on the server, finished or not (played). A TV without the key keeps the one row of Continue Watching.
  */
 final class Jellyfin {
     private Jellyfin() {}
@@ -35,7 +35,9 @@ final class Jellyfin {
     private static final String START = PKG + "/.ui.startup.StartupActivity";
     static final int MAX = 16;
     static final int LOADING = 0, OK = 1, FAILED = 2;
-    private static final long FRESH_MS = 3 * 60_000L, RETRY_MS = 60_000L;
+    /** Recently Watched's cards: as many as Continue Watching's row holds. */
+    static final int PLAYED_MAX = WatchNext.MAX;
+    private static final long FRESH_MS = 3 * 60_000L, PLAYED_FRESH_MS = 15_000L, RETRY_MS = 60_000L;
     private static final int MAX_JSON = 4 << 20, MAX_PICTURE = 8 << 20;
 
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
@@ -44,10 +46,26 @@ final class Jellyfin {
     private static volatile String key = "";
     private static volatile long keyAt = -1;
     private static volatile String userId;
-    private static volatile List<WatchNext.Item> items = Collections.emptyList();
-    private static volatile int state = LOADING;
-    private static volatile long readAt = -1;
-    private static volatile boolean reading;
+
+    /** One list read from the server: what's in memory, how the last read went, and when it was. */
+    private static final class Feed {
+        final long freshMs;
+        volatile List<WatchNext.Item> items = Collections.emptyList();
+        volatile int state = LOADING;
+        volatile long readAt = -1;
+        volatile boolean reading;
+
+        Feed(long freshMs) {
+            this.freshMs = freshMs;
+        }
+    }
+
+    private interface Reader {
+        List<WatchNext.Item> read() throws IOException, org.json.JSONException;
+    }
+
+    /** Recently Added, and Recently Watched (read again sooner: you come back from Jellyfin having watched something). */
+    private static final Feed LATEST = new Feed(FRESH_MS), PLAYED = new Feed(PLAYED_FRESH_MS);
 
     /** A server in config.properties and its key sent to this TV (the key read again every 30 s at most). */
     static boolean configured(Context c) {
@@ -57,7 +75,8 @@ final class Jellyfin {
             String k = Secrets.get(c, Secrets.JELLYFIN_KEY);
             if (!k.equals(key)) {
                 userId = null;   // another key may be another user's
-                readAt = -1;
+                LATEST.readAt = -1;
+                PLAYED.readAt = -1;
             }
             key = k;
             keyAt = now;
@@ -65,9 +84,14 @@ final class Jellyfin {
         return !key.isEmpty();
     }
 
-    /** LOADING (not read yet), OK or FAILED (the last read; the list keeps what came before). */
+    /** Recently Added's LOADING (not read yet), OK or FAILED (the last read; the list keeps what came before). */
     static int state() {
-        return state;
+        return LATEST.state;
+    }
+
+    /** The same for Recently Watched. */
+    static int playedState() {
+        return PLAYED.state;
     }
 
     /**
@@ -75,32 +99,56 @@ final class Jellyfin {
      * minutes they're read again on Jellyfin's own thread, and `changed` runs on the main thread if they changed.
      */
     static List<WatchNext.Item> latest(Context c, Runnable changed) {
-        if (!configured(c)) return Collections.emptyList();
-        long now = SystemClock.uptimeMillis();
-        long due = state == FAILED ? RETRY_MS : FRESH_MS;
-        if (!reading && (readAt < 0 || now - readAt > due)) {
-            reading = true;
-            readAt = now;
-            WORKER.execute(() -> {
-                int before = state;
-                List<WatchNext.Item> old = items;
-                try {
-                    items = read();
-                    state = OK;
-                } catch (Exception e) {   // never past this thread: :home's watchdog counts it as a crash
-                    AppLog.w("jellyfin: " + e.getMessage());
-                    state = FAILED;
-                } finally {
-                    readAt = SystemClock.uptimeMillis();
-                    reading = false;
-                }
-                if (state != before || items != old) MAIN.post(changed);
-            });
-        }
-        return items;
+        return fetch(c, LATEST, Jellyfin::readLatest, changed);
     }
 
-    private static List<WatchNext.Item> read() throws IOException, org.json.JSONException {
+    /**
+     * What was played last, finished or not, newest first and one card per show (its last episode), the same way:
+     * Recently Watched, the row that takes Continue Watching's place when Jellyfin is set up.
+     */
+    static List<WatchNext.Item> played(Context c, Runnable changed) {
+        return fetch(c, PLAYED, Jellyfin::readPlayed, changed);
+    }
+
+    private static List<WatchNext.Item> fetch(Context c, Feed f, Reader reader, Runnable changed) {
+        if (!configured(c)) return Collections.emptyList();
+        long now = SystemClock.uptimeMillis();
+        long due = f.state == FAILED ? RETRY_MS : f.freshMs;
+        if (!f.reading && (f.readAt < 0 || now - f.readAt > due)) {
+            f.reading = true;
+            f.readAt = now;
+            WORKER.execute(() -> {
+                int before = f.state;
+                List<WatchNext.Item> old = f.items;
+                try {
+                    List<WatchNext.Item> fresh = reader.read();
+                    if (!same(fresh, old)) f.items = fresh;
+                    f.state = OK;
+                } catch (Exception e) {   // never past this thread: :home's watchdog counts it as a crash
+                    AppLog.w("jellyfin: " + e.getMessage());
+                    f.state = FAILED;
+                } finally {
+                    f.readAt = SystemClock.uptimeMillis();
+                    f.reading = false;
+                }
+                if (f.state != before || f.items != old) MAIN.post(changed);
+            });
+        }
+        return f.items;
+    }
+
+    private static boolean same(List<WatchNext.Item> a, List<WatchNext.Item> b) {
+        if (a.size() != b.size()) return false;
+        for (int i = 0; i < a.size(); i++) {
+            WatchNext.Item x = a.get(i), y = b.get(i);
+            if (!x.intent.equals(y.intent) || !x.title.equals(y.title) || x.position != y.position
+                    || !java.util.Objects.equals(x.episode, y.episode)
+                    || !java.util.Objects.equals(x.picture(), y.picture())) return false;
+        }
+        return true;
+    }
+
+    private static List<WatchNext.Item> readLatest() throws IOException, org.json.JSONException {
         String user = user();
         String query = "?userId=" + user + "&limit=" + MAX + "&groupItems=true&enableImageTypes=Primary,Backdrop,Thumb"
                 + "&imageTypeLimit=1&fields=ParentId";
@@ -114,107 +162,66 @@ final class Jellyfin {
         JSONArray all = new JSONArray(body);
         List<WatchNext.Item> out = new ArrayList<>();
         for (int i = 0; i < all.length() && out.size() < MAX; i++) {
+            WatchNext.Item it = item(all.getJSONObject(i));
+            if (it != null) out.add(it);
+        }
+        return out;
+    }
+
+    private static List<WatchNext.Item> readPlayed() throws IOException, org.json.JSONException {
+        String user = user();
+        // Sorted by when it was last played; never-played items come last and are left out below. Episodes of one
+        // show collapse into one card, so a few more are asked for than shown.
+        String query = "?userId=" + user + "&recursive=true&includeItemTypes=Movie,Episode,Video"
+                + "&sortBy=DatePlayed&sortOrder=Descending&limit=" + (PLAYED_MAX * 4) + "&enableUserData=true"
+                + "&enableImageTypes=Primary,Backdrop,Thumb&imageTypeLimit=1&fields=ParentId";
+        String body;
+        try {
+            body = get("/Items" + query);
+        } catch (Status e) {
+            if (e.code != 404) throw e;
+            body = get("/Users/" + user + "/Items" + query);   // servers before 10.9
+        }
+        JSONArray all = new JSONObject(body).optJSONArray("Items");
+        List<WatchNext.Item> out = new ArrayList<>();
+        java.util.Set<String> shows = new java.util.HashSet<>();
+        for (int i = 0; all != null && i < all.length() && out.size() < PLAYED_MAX; i++) {
             JSONObject o = all.getJSONObject(i);
-            String id = o.optString("Id", "");
-            if (!id.matches("[0-9a-fA-F-]{32,36}")) continue;
-            WatchNext.Item it = new WatchNext.Item(PKG, picture(o), true);
-            String type = o.optString("Type");
-            String series = o.optString("SeriesName", "");
-            it.title = "Episode".equals(type) && !series.isEmpty() ? series : o.optString("Name", "");
-            if (it.title.isEmpty()) continue;
-            if ("Episode".equals(type) && o.has("ParentIndexNumber") && o.has("IndexNumber")) {
-                it.episode = Ui.trf("S{season} E{episode}", "season", o.optInt("ParentIndexNumber"),
-                        "episode", o.optInt("IndexNumber"));
-            } else if (o.optInt("ProductionYear") > 0) {
-                it.episode = String.valueOf(o.optInt("ProductionYear"));
+            JSONObject data = o.optJSONObject("UserData");
+            if (data == null || data.optString("LastPlayedDate", "").isEmpty()) continue;
+            if (!data.optBoolean("Played") && data.optLong("PlaybackPositionTicks") <= 0) continue;
+            String series = o.optString("SeriesId", "");
+            if (!series.isEmpty() && !shows.add(series)) continue;
+            WatchNext.Item it = item(o);
+            if (it == null) continue;
+            // Half-watched ones keep their bar and "min left"; finished ones have none (position 0).
+            if (!data.optBoolean("Played")) {
+                it.position = data.optLong("PlaybackPositionTicks") / 10_000;
+                it.duration = o.optLong("RunTimeTicks") / 10_000;
             }
-            it.app = "Jellyfin";
-            it.intent = "intent:#Intent;component=" + START + ";S.ItemId=" + id + ";end";
             out.add(it);
         }
         return out;
     }
 
-    /**
-     * Continue Watching's cards from Jellyfin's app with the episode's own picture: the app publishes the show's art,
-     * and its intent names the item (S.ItemId). Ids not seen yet are looked up together on Jellyfin's thread, and
-     * `changed` runs on the main thread when their pictures are known; until then a card keeps the app's picture.
-     */
-    static List<WatchNext.Item> episodePictures(Context c, List<WatchNext.Item> list, Runnable changed) {
-        if (!configured(c)) return list;
-        List<WatchNext.Item> out = new ArrayList<>(list.size());
-        final List<String> unknown = new ArrayList<>();
-        for (WatchNext.Item it : list) {
-            String id = PKG.equals(it.pkg) ? itemId(it.intent) : null;
-            String path = id == null ? null : PICTURES.get(id);
-            if (id != null && path == null && !unknown.contains(id)) unknown.add(id);
-            out.add(path == null || path.isEmpty() ? it : it.withJellyfinPicture(path));
+    /** A card for one of the server's items, or null when it has no usable id or title. */
+    private static WatchNext.Item item(JSONObject o) {
+        String id = o.optString("Id", "");
+        if (!id.matches("[0-9a-fA-F-]{32,36}")) return null;
+        WatchNext.Item it = new WatchNext.Item(PKG, picture(o), true);
+        String type = o.optString("Type");
+        String series = o.optString("SeriesName", "");
+        it.title = "Episode".equals(type) && !series.isEmpty() ? series : o.optString("Name", "");
+        if (it.title.isEmpty()) return null;
+        if ("Episode".equals(type) && o.has("ParentIndexNumber") && o.has("IndexNumber")) {
+            it.episode = Ui.trf("S{season} E{episode}", "season", o.optInt("ParentIndexNumber"),
+                    "episode", o.optInt("IndexNumber"));
+        } else if (o.optInt("ProductionYear") > 0) {
+            it.episode = String.valueOf(o.optInt("ProductionYear"));
         }
-        long now = SystemClock.uptimeMillis();
-        if (!unknown.isEmpty() && !looking && (lookedAt < 0 || now - lookedAt > RETRY_MS || lookedOk)) {
-            looking = true;
-            lookedAt = now;
-            WORKER.execute(() -> {
-                boolean found = false;
-                try {
-                    found = lookUp(unknown);
-                    lookedOk = true;
-                } catch (Exception e) {   // never past this thread: :home's watchdog counts it as a crash
-                    AppLog.w("jellyfin pictures: " + e.getMessage());
-                    lookedOk = false;
-                } finally {
-                    lookedAt = SystemClock.uptimeMillis();
-                    looking = false;
-                }
-                if (found) MAIN.post(changed);
-            });
-        }
-        return out;
-    }
-
-    /** id → its picture's path on the server ("": none), for Continue Watching's cards. */
-    private static final java.util.Map<String, String> PICTURES = new java.util.concurrent.ConcurrentHashMap<>();
-    private static volatile boolean looking, lookedOk;
-    private static volatile long lookedAt = -1;
-
-    private static String itemId(String intent) {
-        if (intent == null) return null;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile(";S\\.ItemId=([0-9a-fA-F-]{32,36});").matcher(intent);
-        return m.find() ? key(m.group(1)) : null;
-    }
-
-    /** Ids as the server writes them in lists: 32 hex digits, lower case (an intent may carry the dashed form). */
-    private static String key(String id) {
-        return id.replace("-", "").toLowerCase(java.util.Locale.ROOT);
-    }
-
-    /** Whether any picture was found for `ids`; each one asked is remembered, found or not. */
-    private static boolean lookUp(List<String> ids) throws IOException, org.json.JSONException {
-        String user = user();
-        StringBuilder q = new StringBuilder("?userId=").append(user).append("&ids=");
-        for (int i = 0; i < ids.size(); i++) q.append(i == 0 ? "" : ",").append(ids.get(i));
-        q.append("&enableImageTypes=Primary,Backdrop,Thumb&imageTypeLimit=1&fields=ParentId");
-        String body;
-        try {
-            body = get("/Items" + q);
-        } catch (Status e) {
-            if (e.code != 404) throw e;
-            body = get("/Users/" + user + "/Items" + q);   // servers before 10.9
-        }
-        JSONArray all = new JSONObject(body).optJSONArray("Items");
-        if (PICTURES.size() > 200) PICTURES.clear();
-        boolean found = false;
-        for (int i = 0; all != null && i < all.length(); i++) {
-            JSONObject o = all.getJSONObject(i);
-            String path = picture(o);
-            if (path == null) continue;
-            PICTURES.put(key(o.optString("Id")), path);
-            found = true;
-        }
-        for (String id : ids) {
-            if (!PICTURES.containsKey(id)) PICTURES.put(id, "");
-        }
-        return found;
+        it.app = "Jellyfin";
+        it.intent = "intent:#Intent;component=" + START + ";S.ItemId=" + id + ";end";
+        return it;
     }
 
     /**

@@ -190,7 +190,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     // scrolls, Z_WATCH) or nothing. Its texts are measured once per list and its pictures decoded once (WatchArt), so
     // drawing the row costs no more than the picks.
     private String topMode = Prefs.TOP_PICKS;
-    /** A row of 16:9 cards: Continue Watching, and under it Jellyfin's Recently Added (Z_RECENT) when it's set up. */
+    /**
+     * A row of 16:9 cards: Continue Watching; when Jellyfin is set up, Recently Watched from the server in its place,
+     * and under it Recently Added (Z_RECENT).
+     */
     private static final class CardRow {
         final int zone;
         List<WatchNext.Item> items = new ArrayList<>();
@@ -215,6 +218,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private final CardRow watchRow = new CardRow(Z_WATCH, WatchNext.MAX), recentRow = new CardRow(Z_RECENT, Jellyfin.MAX);
     private boolean watchAllowed = true;
     private boolean watchLoaded;   // read at least once: before that, no "nothing half-watched"
+    private int watchState = Jellyfin.OK;   // with Jellyfin, Recently Watched's LOADING, OK or FAILED
     // Jellyfin's row: shown with Continue Watching once its server and key are there (Jellyfin.configured), and then
     // the cards are smaller, so the two rows and the shelf fit. recentState: Jellyfin.LOADING, OK or FAILED.
     private boolean threeRows;
@@ -2701,9 +2705,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             final String mode = Prefs.topContent();
             final boolean allowed = WatchNext.allowed(c);
             final boolean jellyfin = mode.equals(Prefs.TOP_CONTINUE) && Jellyfin.configured(c);
-            // Jellyfin's cards there with the episode's own picture (the app publishes the show's), once it's known.
+            // With Jellyfin, the first row is Recently Watched from the server (finished or not) instead of the TV's
+            // Watch Next list; what's in memory now, read again on Jellyfin's thread.
             final List<WatchNext.Item> w = !mode.equals(Prefs.TOP_CONTINUE) ? new ArrayList<>()
-                    : jellyfin ? Jellyfin.episodePictures(c, WatchNext.load(c), jellyfinIn) : WatchNext.load(c);
+                    : jellyfin ? withoutHidden(Jellyfin.played(c, jellyfinIn)) : WatchNext.load(c);
+            final int playedState = Jellyfin.playedState();
             // Jellyfin's newest: what's in memory now; a refresh runs on its own thread and reloads when it's in.
             final List<WatchNext.Item> latest = jellyfin ? Jellyfin.latest(c, jellyfinIn) : new ArrayList<>();
             final int latestState = Jellyfin.state();
@@ -2711,7 +2717,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 // A provider/package refresh must not cancel a drag or undo a move that was just saved.
                 boolean keepOrder = reordering || pendingOrderSaves > 0 || orderAtLoad != orderRevision;
                 if (top != null && !keepOrder) setLightButtons(top);
-                setTopContent(mode, w, allowed);
+                setTopContent(mode, w, allowed || jellyfin, jellyfin ? playedState : Jellyfin.OK);
                 setRecent(jellyfin, latest, latestState);
                 if (s != null && !keepOrder) setShelf(s);
                 if (apps && keepOrder) appsStale = true;
@@ -4126,8 +4132,25 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         return topMode.equals(Prefs.TOP_CONTINUE);
     }
 
-    /** What the top shows now (from reload, off the main thread) and, for Continue Watching, its list. */
-    private void setTopContent(String mode, List<WatchNext.Item> list, boolean allowed) {
+    /** The top's title: "For You", or the first row's name (Recently Watched when it comes from Jellyfin). */
+    private String topTitle() {
+        return picksMode() ? Ui.tr("For You") : threeRows ? Ui.tr("Recently Watched") : Ui.tr("Continue Watching");
+    }
+
+    /** Cards hidden from the row (holding OK on one), left out of Jellyfin's Recently Watched too. */
+    private static List<WatchNext.Item> withoutHidden(List<WatchNext.Item> list) {
+        java.util.Set<String> hidden = Prefs.watchHidden();
+        if (hidden.isEmpty()) return list;
+        List<WatchNext.Item> out = new ArrayList<>(list.size());
+        for (WatchNext.Item it : list) if (!hidden.contains(WatchNext.hideKey(it))) out.add(it);
+        return out;
+    }
+
+    /**
+     * What the top shows now (from reload, off the main thread) and, for Continue Watching, its list; `state` is
+     * Jellyfin's for Recently Watched (Jellyfin.OK for the TV's own list).
+     */
+    private void setTopContent(String mode, List<WatchNext.Item> list, boolean allowed, int state) {
         if (!hiddenNow.isEmpty()) {
             List<WatchNext.Item> shown = new ArrayList<>(list.size());
             for (WatchNext.Item it : list) if (!hiddenNow.contains(WatchNext.hideKey(it))) shown.add(it);
@@ -4136,8 +4159,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         boolean modeChanged = !mode.equals(topMode);
         boolean listChanged = !sameWatching(list, watchRow.items);
         // The permission (granted or taken back) and the first read change what an empty row says: redraw for those.
-        boolean textChanged = allowed != watchAllowed || !watchLoaded && mode.equals(Prefs.TOP_CONTINUE);
+        boolean textChanged = allowed != watchAllowed || state != watchState
+                || !watchLoaded && mode.equals(Prefs.TOP_CONTINUE);
         watchAllowed = allowed;
+        watchState = state;
         if (mode.equals(Prefs.TOP_CONTINUE)) watchLoaded = true;
         if (!modeChanged && !listChanged) {
             if (textChanged) heroDirty = true;
@@ -4226,8 +4251,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         for (int i = 0; i < n; i++) {
             WatchNext.Item it = row.items.get(i);
             row.titles[i] = TextUtils.ellipsize(it.title, tp, width, TextUtils.TruncateAt.END).toString();
-            // Recently Added's cards are all Jellyfin's: no app name on them.
-            StringBuilder meta = new StringBuilder(it.app == null || row == recentRow ? "" : it.app);
+            // Jellyfin's rows (Recently Watched and Recently Added) are all Jellyfin's: no app name on them.
+            StringBuilder meta = new StringBuilder(it.app == null || threeRows ? "" : it.app);
             if (it.episode != null) meta.append(meta.length() > 0 ? " · " : "").append(it.episode);
             String left = timeLeft(it);
             if (left != null) meta.append(meta.length() > 0 ? " · " : "").append(left);
@@ -4257,7 +4282,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private void drawRow(Canvas c, CardRow row) {
         if (row.items.isEmpty()) {
             String text;
-            if (row == watchRow) {
+            if (row == watchRow && threeRows) {
+                if (!watchLoaded || watchState == Jellyfin.LOADING) return;
+                text = watchState == Jellyfin.FAILED ? Ui.trf("Couldn't reach {app}.", "app", "Jellyfin")
+                        : Ui.trf("Nothing watched in {app} yet.", "app", "Jellyfin");
+            } else if (row == watchRow) {
                 if (!watchLoaded) return;   // not read yet: saying "nothing" now could be wrong
                 text = watchAllowed ? Ui.tr("Nothing half-watched in your apps.")
                         : Ui.tr("Missing permission: pick Continue Watching again in Home Settings.");
@@ -4444,7 +4473,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         menuTitle = TextUtils.ellipsize(title, new TextPaint(menuTitlePaint), width, TextUtils.TruncateAt.END).toString();
         menuSub = menuItem.app == null ? "" : TextUtils.ellipsize(menuItem.app, new TextPaint(menuSubPaint), width,
                 TextUtils.TruncateAt.END).toString();
-        menuOptions[0] = Ui.tr("Hide from Continue Watching");
+        menuOptions[0] = threeRows ? Ui.tr("Hide from Recently Watched") : Ui.tr("Hide from Continue Watching");
         menuOptions[1] = Ui.tr("Open the app");
         menuOptions[2] = Ui.tr("Cancel");
         layoutMenu();
@@ -4734,7 +4763,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             if (HomeData.coinCount() > 0 || playingTab != null) drawQuotes(c);
             return;
         }
-        String hello = picksMode() ? Ui.tr("For You") : Ui.tr("Continue Watching");
+        String hello = topTitle();
         c.drawText(hello, MARGIN * k - Ui.leftBearing(lTitle, hello), L_TITLE_BASE * k, lTitle);
         titleRight = MARGIN * k + lTitle.measureText(hello);
         if (!picksMode()) {
@@ -4948,8 +4977,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         float height = L_STATUS * k, gap = L_STATUS_GAP * k;
         int color = Ui.alpha(tone(L_INK, 0xEBFFFFFF), 0.85f);
         float x = MARGIN * k;
-        // The top title ("For You", or "Continue Watching") is on this line too: the icons start after it, not on it.
-        if (!clockMode()) x += lTitle.measureText(picksMode() ? Ui.tr("For You") : Ui.tr("Continue Watching")) + gap;
+        // The top title ("For You", "Continue Watching" or "Recently Watched") is on this line too: the icons start after it, not on it.
+        if (!clockMode()) x += lTitle.measureText(topTitle()) + gap;
         if (network != 0) x = drawStatusIcon(c, network == 2 ? "ethernet" : "wifi", x, height, gap, color);
         if (bluetoothConnected) x = drawStatusIcon(c, "bluetooth", x, height, gap, color);
         if (usbConnected) drawStatusIcon(c, "usb", x, height, gap, color);
