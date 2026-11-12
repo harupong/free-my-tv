@@ -223,8 +223,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     // the cards are smaller, so the two rows and the shelf fit. recentState: Jellyfin.LOADING, OK or FAILED.
     private boolean threeRows;
     private int recentState = Jellyfin.LOADING;
-    private LinearGradient watchSheen, watchRim;   // focus sheen and rim, made once per card size (not per frame)
-    private float watchShaderW;
+    // How much a Continue Watching or Jellyfin card has the focus (0-1): the other cards' titles fade by as much.
+    private float watchFocus;
     private WatchArt watchArt;
     // Holding OK on a card: a small menu (hide it, open the app, cancel) on its own layer, drawn only while it shows.
     private static final float MENU_W = 720, MENU_PAD = 44, MENU_INSET = 16, MENU_ROW = 76, MENU_STEP = 80, MENU_R = 36;
@@ -375,6 +375,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private final Paint imageFill = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final Paint border = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint rim = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint sheen = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint veil = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -4315,6 +4316,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     }
 
     private void drawWatchRow(Canvas c) {
+        watchFocus = 0;
+        for (Spring s : watchRow.focus) watchFocus = Math.max(watchFocus, s.value);
+        if (threeRows) for (Spring s : recentRow.focus) watchFocus = Math.max(watchFocus, s.value);
+        watchFocus = Ui.clamp(watchFocus);
         drawRow(c, watchRow);
         if (!threeRows) return;
         // The headings take the card titles' colour, which applyWatchContrast keeps readable on the background.
@@ -4352,7 +4357,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         int top = -1;
         for (int i = 0; i < row.items.size(); i++) if (row.focus[i].value > 0.02f && (top < 0 || row.focus[i].value > row.focus[top].value)) top = i;
         // Cards scrolled past the left margin slide out under this edge instead of leaving a sliver there (the first
-        // card's focus growth and shadow still fit).
+        // card's focus growth, ring and shadow still fit: 26 + 9.5 px on Continue Watching's 520 px card).
         c.save();
         c.clipRect(watchLeftEdge(), 0, w, h);
         for (int i = 0; i < row.items.size(); i++) if (i != top) drawWatchCard(c, row, i);
@@ -4361,7 +4366,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     }
 
     private float watchLeftEdge() {
-        return (MARGIN - 32) * k;
+        return (MARGIN - 40) * k;
     }
 
     /** `ink`, or as much nearer black (light backgrounds) or white (dark ones) as it takes for 4.5:1 on `bg`. */
@@ -4386,14 +4391,15 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         return x <= 0.04045f ? x / 12.92f : (float) Math.pow((x + 0.055f) / 1.055f, 2.4);
     }
 
-    /** Like a pick's card (same focus, shadow, sheen and rim), with the progress bar on the picture. */
+    /** A 16:9 card with the progress bar on the picture; focused, it grows, rises and gets a ring (no sheen or rim). */
     private void drawWatchCard(Canvas c, CardRow row, int i) {
         rowRect(row, i, cell);
         if (cell.left > w || cell.right <= watchLeftEdge()) return;   // scrolled off screen
         WatchNext.Item it = row.items.get(i);
-        float v = row.focus[i].value, f = Ui.clamp(v), s = 1 + 0.05f * v;
+        // Focused, it grows 10% and rises: at the two rows' size (302 px) the picks' 5% was hard to see from the sofa.
+        float v = row.focus[i].value, f = Ui.clamp(v), s = 1 + 0.1f * v;
         float bw = cell.width(), bh = cell.height(), r0 = (threeRows ? 14 : 18) * k, r = r0 * s;
-        float cx = cell.centerX(), cy = cell.centerY() - 6 * k * v, textLeft = cell.left, textTop = cell.bottom;
+        float cx = cell.centerX(), cy = cell.centerY() - 8 * k * v, textLeft = cell.left, textTop = cell.bottom;
         c.save();
         c.translate(cx, cy);
         c.scale(s, s);
@@ -4423,30 +4429,21 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             c.drawRoundRect(tmp, bar / 2, bar / 2, fill);
         }
         if (f > 0.01f) {
-            // Drawn at the card's resting size, scaled with it: the gradients are made once, not on every frame.
-            if (watchSheen == null || watchShaderW != bw) {
-                watchSheen = new LinearGradient(-bw / 2, -bh / 2, 0, bh / 2, 0x38FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP);
-                watchRim = new LinearGradient(0, -bh / 2, 0, bh / 2, 0xE6FFFFFF, 0x59FFFFFF, Shader.TileMode.CLAMP);
-                watchShaderW = bw;
-            }
-            int alpha = Math.round(255 * f);
-            c.save();
-            c.translate(cx, cy);
-            c.scale(s, s);
-            tmp.set(-bw / 2, -bh / 2, bw / 2, bh / 2);
-            sheen.setShader(watchSheen);
-            sheen.setAlpha(alpha);
-            c.drawRoundRect(tmp, r0, r0, sheen);
-            sheen.setAlpha(255);
-            rim.setShader(watchRim);
-            rim.setAlpha(alpha);
-            rim.setStrokeWidth(2.5f * k / s);
-            c.drawRoundRect(tmp, r0, r0, rim);
-            rim.setStrokeWidth(2.5f * k);
-            rim.setAlpha(255);
-            c.restore();
+            // A ring around it, a gap away, in the titles' colour (dark by day, light by night, kept readable on the
+            // background by applyWatchContrast): unlike a white rim it shows on any picture, light or dark.
+            float gap = 4 * k, width = 5 * k, out = gap + width / 2;
+            ring.setStyle(Paint.Style.STROKE);
+            ring.setStrokeWidth(width);
+            ring.setColor(Ui.alpha(lCardTitle.getColor(), f));
+            tmp.set(cell.left - out, cell.top - out, cell.right + out, cell.bottom + out);
+            c.drawRoundRect(tmp, r + out, r + out, ring);
         }
-        c.drawText(row.titles[i], textLeft, textTop + (threeRows ? 36 : 46) * k, rowTitlePaint());
+        // While a card has the focus, the others' titles step back to the details' colour.
+        Paint title = rowTitlePaint();
+        int ink = title.getColor();
+        title.setColor(blend(lCardMeta.getColor(), ink, Math.max(f, 1 - watchFocus)));
+        c.drawText(row.titles[i], textLeft, textTop + (threeRows ? 36 : 46) * k, title);
+        title.setColor(ink);
         if (!row.metas[i].isEmpty()) c.drawText(row.metas[i], textLeft, textTop + (threeRows ? 64 : 80) * k, rowMetaPaint());
     }
 
