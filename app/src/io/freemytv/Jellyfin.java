@@ -151,7 +151,7 @@ final class Jellyfin {
     private static List<WatchNext.Item> readLatest() throws IOException, org.json.JSONException {
         String user = user();
         String query = "?userId=" + user + "&limit=" + MAX + "&groupItems=true&enableImageTypes=Primary,Backdrop,Thumb"
-                + "&imageTypeLimit=1&fields=ParentId";
+                + "&imageTypeLimit=1&fields=ParentId,DateCreated,DateLastMediaAdded";
         String body;
         try {
             body = get("/Items/Latest" + query);
@@ -174,7 +174,8 @@ final class Jellyfin {
         // show collapse into one card, so a few more are asked for than shown.
         String query = "?userId=" + user + "&recursive=true&includeItemTypes=Movie,Episode,Video"
                 + "&sortBy=DatePlayed&sortOrder=Descending&limit=" + (PLAYED_MAX * 4) + "&enableUserData=true"
-                + "&enableImageTypes=Primary,Backdrop,Thumb&imageTypeLimit=1&fields=ParentId";
+                + "&enableImageTypes=Primary,Backdrop,Thumb&imageTypeLimit=1"
+                + "&fields=ParentId,DateCreated,DateLastMediaAdded";
         String body;
         try {
             body = get("/Items" + query);
@@ -213,15 +214,36 @@ final class Jellyfin {
         String series = o.optString("SeriesName", "");
         it.title = "Episode".equals(type) && !series.isEmpty() ? series : o.optString("Name", "");
         if (it.title.isEmpty()) return null;
-        if ("Episode".equals(type) && o.has("ParentIndexNumber") && o.has("IndexNumber")) {
-            it.episode = Ui.trf("S{season} E{episode}", "season", o.optInt("ParentIndexNumber"),
-                    "episode", o.optInt("IndexNumber"));
-        } else if (o.optInt("ProductionYear") > 0) {
-            it.episode = String.valueOf(o.optInt("ProductionYear"));
-        }
+        // When it came to the server: a show grouped in Recently Added carries its newest episode's date.
+        long added = parseDate(o.optString("DateLastMediaAdded", ""));
+        if (added <= 0) added = parseDate(o.optString("DateCreated", ""));
+        if (added > 0) it.episode = Ui.trf("Added {date}", "date", addedDate(added));
         it.app = "Jellyfin";
         it.intent = "intent:#Intent;component=" + START + ";S.ItemId=" + id + ";end";
         return it;
+    }
+
+    /** Jellyfin's "2026-11-17T12:34:56.1234567Z" (UTC) in ms, or 0. */
+    private static long parseDate(String s) {
+        if (s.length() < 19) return 0;
+        try {
+            java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US);
+            f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+            long at = f.parse(s.substring(0, 19)).getTime();
+            return at > 0 ? at : 0;   // year 1 means none
+        } catch (java.text.ParseException | RuntimeException e) {
+            return 0;
+        }
+    }
+
+    /** "Nov 17" in the TV's language, with the year when it isn't this one. */
+    private static String addedDate(long at) {
+        java.util.Calendar then = java.util.Calendar.getInstance(), now = java.util.Calendar.getInstance();
+        then.setTimeInMillis(at);
+        String skeleton = then.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) ? "MMMd" : "yMMMd";
+        java.util.Locale loc = Ui.locale();
+        String pattern = android.text.format.DateFormat.getBestDateTimePattern(loc, skeleton);
+        return new java.text.SimpleDateFormat(pattern, loc).format(new java.util.Date(at));
     }
 
     /**
