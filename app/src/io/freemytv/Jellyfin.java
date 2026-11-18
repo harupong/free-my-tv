@@ -214,10 +214,16 @@ final class Jellyfin {
         String series = o.optString("SeriesName", "");
         it.title = "Episode".equals(type) && !series.isEmpty() ? series : o.optString("Name", "");
         if (it.title.isEmpty()) return null;
-        // When it came to the server: a show grouped in Recently Added carries its newest episode's date.
-        long added = parseDate(o.optString("DateLastMediaAdded", ""));
-        if (added <= 0) added = parseDate(o.optString("DateCreated", ""));
-        if (added > 0) it.episode = Ui.trf("Added {date}", "date", addedDate(added));
+        // An episode's air date, as Jellyfin shows it; else when it came to the server (a show grouped in Recently
+        // Added carries its newest episode's). A recording added after midnight still shows the day it aired.
+        String aired = "Episode".equals(type) ? o.optString("PremiereDate", "") : "";
+        if (parseDate(aired) > 0) {
+            it.episode = Ui.trf("Aired {date}", "date", shortDate(aired));
+        } else {
+            String added = o.optString("DateLastMediaAdded", "");
+            if (parseDate(added) <= 0) added = o.optString("DateCreated", "");
+            if (parseDate(added) > 0) it.episode = Ui.trf("Added {date}", "date", shortDate(added));
+        }
         it.app = "Jellyfin";
         it.intent = "intent:#Intent;component=" + START + ";S.ItemId=" + id + ";end";
         return it;
@@ -236,14 +242,22 @@ final class Jellyfin {
         }
     }
 
-    /** "Nov 17" in the TV's language, with the year when it isn't this one. */
-    private static String addedDate(long at) {
-        java.util.Calendar then = java.util.Calendar.getInstance(), now = java.util.Calendar.getInstance();
+    /**
+     * "Nov 17" in the TV's language, with the year when it isn't this one. A date with no time (midnight UTC, as an
+     * air date is kept) stays that day; a moment is shown in the TV's time zone.
+     */
+    private static String shortDate(String s) {
+        java.util.TimeZone zone = s.startsWith("T00:00:00", 10) ? java.util.TimeZone.getTimeZone("UTC")
+                : java.util.TimeZone.getDefault();
+        long at = parseDate(s);
+        java.util.Calendar then = java.util.Calendar.getInstance(zone), now = java.util.Calendar.getInstance(zone);
         then.setTimeInMillis(at);
         String skeleton = then.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) ? "MMMd" : "yMMMd";
         java.util.Locale loc = Ui.locale();
-        String pattern = android.text.format.DateFormat.getBestDateTimePattern(loc, skeleton);
-        return new java.text.SimpleDateFormat(pattern, loc).format(new java.util.Date(at));
+        java.text.SimpleDateFormat f = new java.text.SimpleDateFormat(
+                android.text.format.DateFormat.getBestDateTimePattern(loc, skeleton), loc);
+        f.setTimeZone(zone);
+        return f.format(new java.util.Date(at));
     }
 
     /**
