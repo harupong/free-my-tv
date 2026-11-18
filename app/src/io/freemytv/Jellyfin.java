@@ -33,6 +33,12 @@ final class Jellyfin {
     static final String PKG = "org.jellyfin.androidtv";
     /** Jellyfin's Android TV app opens an item from its start screen with this extra (as its home screen rows do). */
     private static final String START = PKG + "/.ui.startup.StartupActivity";
+    /**
+     * A new task in place of the one Jellyfin has open (NEW_TASK | CLEAR_TASK). Jellyfin 0.20.0 stops ("Jellyfin has
+     * stopped") when an item is asked for while it's already running in the background; started afresh it opens it.
+     */
+    private static final String LAUNCH_FLAGS = "0x" + Integer.toHexString(
+            android.content.Intent.FLAG_ACTIVITY_NEW_TASK | android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK);
     static final int MAX = 16;
     static final int LOADING = 0, OK = 1, FAILED = 2;
     /** Recently Watched's cards: as many as Continue Watching's row holds. */
@@ -150,7 +156,9 @@ final class Jellyfin {
 
     private static List<WatchNext.Item> readLatest() throws IOException, org.json.JSONException {
         String user = user();
-        String query = "?userId=" + user + "&limit=" + MAX + "&groupItems=true&enableImageTypes=Primary,Backdrop,Thumb"
+        // One card per episode. Grouped, a show with two or more unplayed new episodes comes as the show itself: its
+        // picture instead of the episode's, and OK opens the show, where an episode aired today sits under Upcoming.
+        String query = "?userId=" + user + "&limit=" + MAX + "&groupItems=false&enableImageTypes=Primary,Backdrop,Thumb"
                 + "&imageTypeLimit=1&fields=ParentId,DateCreated,DateLastMediaAdded";
         String body;
         try {
@@ -214,8 +222,8 @@ final class Jellyfin {
         String series = o.optString("SeriesName", "");
         it.title = "Episode".equals(type) && !series.isEmpty() ? series : o.optString("Name", "");
         if (it.title.isEmpty()) return null;
-        // An episode's air date, as Jellyfin shows it; else when it came to the server (a show grouped in Recently
-        // Added carries its newest episode's). A recording added after midnight still shows the day it aired.
+        // An episode's air date, as Jellyfin shows it; else when it came to the server. A recording added after
+        // midnight still shows the day it aired.
         String aired = "Episode".equals(type) ? o.optString("PremiereDate", "") : "";
         if (parseDate(aired) > 0) {
             it.episode = Ui.trf("Aired {date}", "date", shortDate(aired));
@@ -225,7 +233,7 @@ final class Jellyfin {
             if (parseDate(added) > 0) it.episode = Ui.trf("Added {date}", "date", shortDate(added));
         }
         it.app = "Jellyfin";
-        it.intent = "intent:#Intent;component=" + START + ";S.ItemId=" + id + ";end";
+        it.intent = "intent:#Intent;launchFlags=" + LAUNCH_FLAGS + ";component=" + START + ";S.ItemId=" + id + ";end";
         return it;
     }
 
