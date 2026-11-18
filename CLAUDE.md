@@ -12,6 +12,12 @@ Before you push, run `tools/check.sh`: the Google TV build, `translate.py --chec
 `web/` (syntax and the newer calls old TVs lack) and the CSS they can't use. Every pull request runs it too
 (`.github/workflows/check.yml`), with JDK 17, build-tools 34.0.0 and android-34: a newer SDK here can let through a
 call that fails there.
+`config.properties` is git-ignored, so each worktree has its own copy, which can lack settings added in main's since
+(a worktree without `jellyfin_server` built an APK with the Jellyfin rows off). Before building in a worktree, compare
+its keys with the main checkout's (`diff <(sed 's/=.*//' config.properties | sort) <(sed 's/=.*//'
+<main>/config.properties | sort)`) and copy main's over when it has more; a setting added in the worktree goes in
+main's too (`AGENTS.md`). After installing on a TV, take a screenshot (`adb exec-out screencap -p`) and check the
+change is there.
 
 The person you're helping may not be technical. Keep it short and friendly, say what you're about to do on their TV
 before you do it, and let them do the taps on the TV.
